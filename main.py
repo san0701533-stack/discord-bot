@@ -16,8 +16,6 @@ def run_web():
 
 
 threading.Thread(target=run_web, daemon=True).start()
-
-
 import os
 import re
 import asyncio
