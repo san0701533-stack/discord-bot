@@ -15,8 +15,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not DISCORD_TOKEN or not GEMINI_API_KEY:
     raise ValueError("DISCORD_TOKENとGEMINI_API_KEYを設定してください。")
 
-# 無料で使える高速・高性能なGeminiのモデル
-AI_MODEL = "gemini-2.5-flash"
+# 最新の利用可能なモデルに修正済み
+AI_MODEL = "gemini-3.8-flash"
 
 STAFF_ROLES = [
     1569062644919566336,
@@ -31,7 +31,6 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# OpenAIからGemini（Google GenAI）に変更
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 ai_enabled = True
@@ -545,7 +544,7 @@ async def on_message(message):
                 "申し訳ありません。AIの応答でエラーが発生しました。\n"
                 "スタッフに確認を依頼してください。"
             )
-            if channel.id not in handof_notified if 'handoff_notified' in globals() else channel.id not in handoff_notified:
+            if channel.id not in handoff_notified:
                 mentions = staff_mentions(message.guild)
                 await channel.send(f"⚠️ **スタッフの対応をお願いします。**\n{mentions}")
                 handoff_notified.add(channel.id)
