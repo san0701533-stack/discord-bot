@@ -17,25 +17,81 @@ def run_web():
 
 threading.Thread(target=run_web, daemon=True).start()
 
-import discord
-from discord.ext import commands
-from google import genai
+
 import os
 import re
 import asyncio
+import logging
+import threading
+from collections import defaultdict
+
+import discord
+from discord.ext import commands
+from flask import Flask
+from waitress import serve
+from google import genai
+
 
 # ==========================================
-# 1. 基本設定
+# 1. ログ設定
+# ==========================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+
+logger = logging.getLogger("SupportBot")
+discord_logger = logging.getLogger("discord")
+
+
+# ==========================================
+# 2. Render用Webサーバー
+# ==========================================
+
+app = Flask(__name__)
+
+
+@app.route("/")
+def home():
+    return "Bot is alive!", 200
+
+
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    logger.info("Webサーバー起動: port=%s", port)
+
+    serve(
+        app,
+        host="0.0.0.0",
+        port=port
+    )
+
+
+threading.Thread(
+    target=run_web,
+    daemon=True
+).start()
+
+
+# ==========================================
+# 3. 基本設定
 # ==========================================
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-if not DISCORD_TOKEN or not GEMINI_API_KEY:
-    raise ValueError("DISCORD_TOKENとGEMINI_API_KEYを設定してください。")
+AI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-3.8-flash"
+)
 
-# 最新の利用可能なモデルに修正済み
-AI_MODEL = "gemini-3.8-flash"
+if not DISCORD_TOKEN:
+    raise ValueError("DISCORD_TOKENが設定されていません。")
+
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEYが設定されていません。")
+
 
 STAFF_ROLES = [
     1569062644919566336,
@@ -48,17 +104,50 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
 
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
+# ==========================================
+# 4. Bot本体
+# ==========================================
+
+class SupportBot(commands.Bot):
+
+    async def setup_hook(self):
+        self.add_view(TicketPanel())
+        self.add_view(OpenTicketView())
+        self.add_view(ClosedTicketView())
+
+        logger.info("永続Viewの登録が完了しました。")
+
+
+bot = SupportBot(
+    command_prefix="!",
+    intents=intents
+)
+
+
+# ==========================================
+# 5. Gemini設定
+# ==========================================
+
+ai_client = genai.Client(
+    api_key=GEMINI_API_KEY
+)
 
 ai_enabled = True
+
 paused_channels = set()
 histories = {}
 handoff_notified = set()
 
+# AIの同時処理数を制限
+AI_SEMAPHORE = asyncio.Semaphore(2)
+
+# チャンネルごとの処理重複を防止
+channel_locks = defaultdict(asyncio.Lock)
+
+
 # ==========================================
-# 2. 料金表
+# 6. 料金表
 # ==========================================
 
 RANK_NAMES = {
@@ -105,14 +194,20 @@ TROPHY_PRICES = {
     (2500, 3000): 8499
 }
 
+
 # ==========================================
-# 3. スタッフ判定
+# 7. スタッフ判定
 # ==========================================
 
 def is_staff(member):
     if not isinstance(member, discord.Member):
         return False
-    return any(role.id in STAFF_ROLES for role in member.roles)
+
+    return any(
+        role.id in STAFF_ROLES
+        for role in member.roles
+    )
+
 
 def is_ticket(channel):
     return (
@@ -121,38 +216,55 @@ def is_ticket(channel):
         and channel.topic.startswith("ticket_owner:")
     )
 
+
 def get_ticket_owner(channel):
     if not is_ticket(channel):
         return None
+
     try:
         return int(channel.topic.split(":")[1])
-    except:
+    except (ValueError, IndexError, AttributeError):
         return None
 
+
 def staff_mentions(guild):
+    if guild is None:
+        return ""
+
     mentions = []
+
     for role_id in STAFF_ROLES:
         role = guild.get_role(role_id)
+
         if role:
             mentions.append(role.mention)
+
     return " ".join(mentions)
 
+
 # ==========================================
-# 4. ランク認識・料金計算
+# 8. 料金計算
 # ==========================================
 
 def find_ranks(text):
     found = []
+
     for rank, aliases in RANK_ALIASES.items():
         for alias in aliases:
-            pattern = re.escape(alias)
-            if re.search(pattern, text, re.IGNORECASE):
+            if re.search(
+                re.escape(alias),
+                text,
+                re.IGNORECASE
+            ):
                 found.append(rank)
                 break
+
     return sorted(set(found))
+
 
 def calculate_rank_price(text):
     ranks = find_ranks(text)
+
     if len(ranks) < 2:
         return None
 
@@ -163,29 +275,38 @@ def calculate_rank_price(text):
         return None
 
     direct = RANK_PRICES.get((start, goal))
+
     if direct is not None:
         return direct
 
     if len(ranks) >= 3:
         total = 0
+
         for i in range(len(ranks) - 1):
-            price = RANK_SEGMENTS.get((ranks[i], ranks[i + 1]))
+            price = RANK_SEGMENTS.get(
+                (ranks[i], ranks[i + 1])
+            )
+
             if price is None:
                 return None
+
             total += price
+
         return total
 
     return None
 
-# ==========================================
-# 5. トロフィー料金計算
-# ==========================================
 
 def calculate_trophy_price(text):
-    if not re.search(r"トロ|トロフィー|trophy", text, re.IGNORECASE):
+    if not re.search(
+        r"トロ|トロフィー|trophy",
+        text,
+        re.IGNORECASE
+    ):
         return None
 
     numbers = re.findall(r"\d+", text)
+
     if len(numbers) < 2:
         return None
 
@@ -195,14 +316,11 @@ def calculate_trophy_price(text):
     if start >= goal:
         return None
 
-    price = TROPHY_PRICES.get((start, goal))
-    if price is not None:
-        return price
+    return TROPHY_PRICES.get((start, goal))
 
-    return None
 
 # ==========================================
-# 6. AIの設定（Gemini版）
+# 9. Gemini AI
 # ==========================================
 
 SYSTEM_PROMPT = """
@@ -253,35 +371,111 @@ SYSTEM_PROMPT = """
 ユーザーに「スタッフに確認します」と伝えてください。
 """
 
+
 async def ask_ai(channel_id, user_message):
-    history = histories.get(channel_id, [])
 
-    chat_history_text = SYSTEM_PROMPT + "\n\n【これまでの会話】\n"
-    for h in history[-10:]:
-        role_name = "ユーザー" if h["role"] == "user" else "AI"
-        chat_history_text += f"{role_name}: {h['content']}\n"
-    
-    chat_history_text += f"ユーザー: {user_message}\nAI:"
+    async with AI_SEMAPHORE:
 
-    response = await asyncio.to_thread(
-        ai_client.models.generate_content,
-        model=AI_MODEL,
-        contents=chat_history_text
-    )
+        history = histories.get(channel_id, [])
 
-    answer = response.text.strip()
+        chat_history_text = (
+            SYSTEM_PROMPT
+            + "\n\n【これまでの会話】\n"
+        )
 
-    history.append({"role": "user", "content": user_message})
-    history.append({"role": "assistant", "content": answer})
-    histories[channel_id] = history[-16:]
+        for h in history[-10:]:
+            role_name = (
+                "ユーザー"
+                if h["role"] == "user"
+                else "AI"
+            )
 
-    return answer
+            chat_history_text += (
+                f"{role_name}: {h['content']}\n"
+            )
+
+        chat_history_text += (
+            f"ユーザー: {user_message}\nAI:"
+        )
+
+        response = await asyncio.to_thread(
+            ai_client.models.generate_content,
+            model=AI_MODEL,
+            contents=chat_history_text
+        )
+
+        answer = response.text
+
+        if not answer:
+            raise ValueError("Geminiから空の回答が返されました。")
+
+        answer = answer.strip()
+
+        history.append({
+            "role": "user",
+            "content": user_message
+        })
+
+        history.append({
+            "role": "assistant",
+            "content": answer
+        })
+
+        histories[channel_id] = history[-16:]
+
+        return answer
+
 
 # ==========================================
-# 7. チケットパネル
+# 10. Discord送信処理
+# ==========================================
+
+async def safe_send(channel, content, **kwargs):
+
+    try:
+        return await channel.send(
+            content,
+            **kwargs
+        )
+
+    except discord.HTTPException as e:
+        logger.error(
+            "Discord送信エラー: status=%s code=%s text=%s",
+            e.status,
+            e.code,
+            e.text
+        )
+
+    except discord.DiscordException:
+        logger.exception("Discord送信処理でエラーが発生しました。")
+
+    return None
+
+
+async def send_long_message(channel, content):
+
+    if not content:
+        return
+
+    # Discordの文字数制限に合わせて分割
+    chunks = [
+        content[i:i + 1900]
+        for i in range(0, len(content), 1900)
+    ]
+
+    for chunk in chunks:
+        result = await safe_send(channel, chunk)
+
+        if result is None:
+            break
+
+
+# ==========================================
+# 11. チケットパネル
 # ==========================================
 
 class TicketPanel(discord.ui.View):
+
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -292,75 +486,113 @@ class TicketPanel(discord.ui.View):
         custom_id="ticket:create"
     )
     async def create_ticket(self, interaction, button):
+
         guild = interaction.guild
         user = interaction.user
 
         if guild is None:
+            await interaction.response.send_message(
+                "サーバー内で使用してください。",
+                ephemeral=True
+            )
             return
 
         for channel in guild.text_channels:
-            if is_ticket(channel) and get_ticket_owner(channel) == user.id:
+
+            if (
+                is_ticket(channel)
+                and get_ticket_owner(channel) == user.id
+            ):
                 await interaction.response.send_message(
                     f"すでにチケットがあります：{channel.mention}",
                     ephemeral=True
                 )
                 return
 
-        category = discord.utils.get(guild.categories, name=TICKET_CATEGORY)
-        if category is None:
-            category = await guild.create_category(TICKET_CATEGORY)
-
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            user: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                attach_files=True
-            ),
-            guild.me: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                manage_channels=True
+        try:
+            category = discord.utils.get(
+                guild.categories,
+                name=TICKET_CATEGORY
             )
-        }
 
-        for role_id in STAFF_ROLES:
-            role = guild.get_role(role_id)
-            if role:
-                overwrites[role] = discord.PermissionOverwrite(
-                    view_channel=True,
-                    send_messages=True,
-                    read_message_history=True,
-                    manage_channels=True
+            if category is None:
+                category = await guild.create_category(
+                    TICKET_CATEGORY
                 )
 
-        channel = await guild.create_text_channel(
-            name=f"ticket-{user.name}",
-            category=category,
-            overwrites=overwrites,
-            topic=f"ticket_owner:{user.id}"
-        )
+            overwrites = {
+                guild.default_role:
+                    discord.PermissionOverwrite(
+                        view_channel=False
+                    ),
 
-        await interaction.response.send_message(
-            f"チケットを作成しました：{channel.mention}",
-            ephemeral=True
-        )
+                user:
+                    discord.PermissionOverwrite(
+                        view_channel=True,
+                        send_messages=True,
+                        read_message_history=True,
+                        attach_files=True
+                    ),
 
-        await channel.send(
-            f"{user.mention} さん、問い合わせありがとうございます！\n\n"
-            "まずはお問い合わせ内容を教えてください。\n"
-            "ガチバトル代行・トロ上げ代行・その他の相談に対応しています。\n\n"
-            "分からないことや料金表にない内容は、すぐにスタッフへ確認します。",
-            view=OpenTicketView()
-        )
+                guild.me:
+                    discord.PermissionOverwrite(
+                        view_channel=True,
+                        send_messages=True,
+                        read_message_history=True,
+                        manage_channels=True
+                    )
+            }
+
+            for role_id in STAFF_ROLES:
+
+                role = guild.get_role(role_id)
+
+                if role:
+                    overwrites[role] = (
+                        discord.PermissionOverwrite(
+                            view_channel=True,
+                            send_messages=True,
+                            read_message_history=True,
+                            manage_channels=True
+                        )
+                    )
+
+            channel = await guild.create_text_channel(
+                name=f"ticket-{user.name}",
+                category=category,
+                overwrites=overwrites,
+                topic=f"ticket_owner:{user.id}"
+            )
+
+            await interaction.response.send_message(
+                f"チケットを作成しました：{channel.mention}",
+                ephemeral=True
+            )
+
+            await channel.send(
+                f"{user.mention} さん、問い合わせありがとうございます！\n\n"
+                "まずはお問い合わせ内容を教えてください。\n"
+                "ガチバトル代行・トロ上げ代行・その他の相談に対応しています。\n\n"
+                "分からないことや料金表にない内容は、すぐにスタッフへ確認します。",
+                view=OpenTicketView()
+            )
+
+        except discord.HTTPException as e:
+            logger.exception("チケット作成エラー")
+
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "チケットの作成に失敗しました。スタッフに確認してください。",
+                    ephemeral=True
+                )
+
 
 # ==========================================
-# 8. チケット操作ボタン
+# 12. チケット操作
 # ==========================================
 
 class OpenTicketView(discord.ui.View):
+
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -371,21 +603,34 @@ class OpenTicketView(discord.ui.View):
         custom_id="ticket:close"
     )
     async def close_ticket(self, interaction, button):
+
         channel = interaction.channel
         owner_id = get_ticket_owner(channel)
 
-        if not is_staff(interaction.user) and interaction.user.id != owner_id:
-            await interaction.response.send_message("この操作は許可されていません。", ephemeral=True)
+        if (
+            not is_staff(interaction.user)
+            and interaction.user.id != owner_id
+        ):
+            await interaction.response.send_message(
+                "この操作は許可されていません。",
+                ephemeral=True
+            )
             return
 
-        owner = interaction.guild.get_member(owner_id)
-        if owner:
-            await channel.set_permissions(owner, send_messages=False)
+        if owner_id:
+            await channel.set_permissions(
+                discord.Object(id=owner_id),
+                send_messages=False
+            )
 
-        await interaction.response.send_message("チケットを閉じました。", view=ClosedTicketView())
+        await interaction.response.send_message(
+            "チケットを閉じました。",
+            view=ClosedTicketView()
+        )
 
 
 class ClosedTicketView(discord.ui.View):
+
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -396,18 +641,27 @@ class ClosedTicketView(discord.ui.View):
         custom_id="ticket:reopen"
     )
     async def reopen_ticket(self, interaction, button):
+
         if not is_staff(interaction.user):
-            await interaction.response.send_message("スタッフのみ操作できます。", ephemeral=True)
+            await interaction.response.send_message(
+                "スタッフのみ操作できます。",
+                ephemeral=True
+            )
             return
 
         channel = interaction.channel
         owner_id = get_ticket_owner(channel)
-        owner = interaction.guild.get_member(owner_id)
 
-        if owner:
-            await channel.set_permissions(owner, send_messages=True)
+        if owner_id:
+            await channel.set_permissions(
+                discord.Object(id=owner_id),
+                send_messages=True
+            )
 
-        await interaction.response.send_message("チケットを再開しました。", view=OpenTicketView())
+        await interaction.response.send_message(
+            "チケットを再開しました。",
+            view=OpenTicketView()
+        )
 
     @discord.ui.button(
         label="チケットを削除",
@@ -416,34 +670,42 @@ class ClosedTicketView(discord.ui.View):
         custom_id="ticket:delete"
     )
     async def delete_ticket(self, interaction, button):
+
         if not is_staff(interaction.user):
-            await interaction.response.send_message("スタッフのみ操作できます。", ephemeral=True)
+            await interaction.response.send_message(
+                "スタッフのみ操作できます。",
+                ephemeral=True
+            )
             return
 
-        await interaction.response.send_message("チケットを削除します。")
+        await interaction.response.send_message(
+            "チケットを削除します。"
+        )
+
         await interaction.channel.delete()
 
-# ==========================================
-# 9. 起動時の設定
-# ==========================================
 
-@bot.event
-async def setup_hook():
-    bot.add_view(TicketPanel())
-    bot.add_view(OpenTicketView())
-    bot.add_view(ClosedTicketView())
+# ==========================================
+# 13. 起動時
+# ==========================================
 
 @bot.event
 async def on_ready():
-    print(f"Bot起動成功: {bot.user}")
-    print(f"AI: {'有効' if ai_enabled else '無効'}")
+
+    logger.info("================================")
+    logger.info("Bot起動成功: %s", bot.user)
+    logger.info("AI: %s", "有効" if ai_enabled else "無効")
+    logger.info("Geminiモデル: %s", AI_MODEL)
+    logger.info("================================")
+
 
 # ==========================================
-# 10. スタッフ用コマンド
+# 14. スタッフ用コマンド
 # ==========================================
 
 @bot.command()
 async def setup_ticket(ctx):
+
     if not is_staff(ctx.author):
         return
 
@@ -456,42 +718,65 @@ async def setup_ticket(ctx):
         ),
         color=discord.Color.blurple()
     )
-    await ctx.send(embed=embed, view=TicketPanel())
+
+    await ctx.send(
+        embed=embed,
+        view=TicketPanel()
+    )
+
 
 @bot.command()
 async def ai_on(ctx):
+
     global ai_enabled
+
     if not is_staff(ctx.author):
         return
+
     ai_enabled = True
+
     await ctx.send("AIを有効にしました。")
+
 
 @bot.command()
 async def ai_off(ctx):
+
     global ai_enabled
+
     if not is_staff(ctx.author):
         return
+
     ai_enabled = False
+
     await ctx.send("AIを無効にしました。")
+
 
 @bot.command()
 async def ai_resume(ctx):
+
     if not is_staff(ctx.author):
         return
+
     paused_channels.discard(ctx.channel.id)
     handoff_notified.discard(ctx.channel.id)
     histories.pop(ctx.channel.id, None)
-    await ctx.send("This channel's AI has been resumed.")
+
+    await ctx.send(
+        "このチャンネルのAIを再開しました。"
+    )
+
 
 # ==========================================
-# 11. メッセージ処理
+# 15. メッセージ処理
 # ==========================================
 
 @bot.event
 async def on_message(message):
+
     if message.author.bot:
         return
 
+    # コマンドを処理
     await bot.process_commands(message)
 
     if message.content.startswith("!"):
@@ -500,77 +785,195 @@ async def on_message(message):
     channel = message.channel
     ticket = is_ticket(channel)
 
+    # チケット内でスタッフが発言したらAIを停止
     if ticket and is_staff(message.author):
         paused_channels.add(channel.id)
         return
 
-    if not ai_enabled or channel.id in paused_channels:
+    if not ai_enabled:
         return
 
+    if channel.id in paused_channels:
+        return
+
+    # サーバー外では自動応答しない
+    if message.guild is None:
+        return
+
+    # チケット外はメンション・返信時だけ反応
     if not ticket:
-        mentioned = bot.user in message.mentions
+
+        mentioned = (
+            bot.user is not None
+            and bot.user in message.mentions
+        )
+
         replied = False
+
         if message.reference:
-            try:
-                replied_message = await channel.fetch_message(message.reference.message_id)
-                if replied_message.author.id == bot.user.id:
-                    replied = True
-            except:
-                pass
+
+            referenced = message.reference.resolved
+
+            if (
+                isinstance(referenced, discord.Message)
+                and bot.user is not None
+                and referenced.author.id == bot.user.id
+            ):
+                replied = True
+
         if not mentioned and not replied:
             return
 
+    # ======================================
     # 料金の自動判定
+    # ======================================
+
     try:
-        rank_price = calculate_rank_price(message.content)
+
+        rank_price = calculate_rank_price(
+            message.content
+        )
+
         if rank_price is not None:
-            await channel.send(
+
+            await safe_send(
+                channel,
                 f"料金表に基づく見積もりは **{rank_price:,}円** です。\n"
                 "ご依頼内容に間違いがないか確認してください。"
             )
+
             return
 
-        trophy_price = calculate_trophy_price(message.content)
+        trophy_price = calculate_trophy_price(
+            message.content
+        )
+
         if trophy_price is not None:
-            await channel.send(
+
+            await safe_send(
+                channel,
                 f"料金表に基づく見積もりは **{trophy_price:,}円** です。\n"
                 "ご依頼内容に間違いがないか確認してください。"
             )
+
             return
-    except Exception as e:
-        print("料金判定エラー:", repr(e))
 
-    # AIに問い合わせ
-    async with channel.typing():
+    except Exception:
+        logger.exception("料金判定エラー")
+
+    # ======================================
+    # Gemini AIに問い合わせ
+    # ======================================
+
+    async with channel_locks[channel.id]:
+
+        if channel.id in paused_channels:
+            return
+
         try:
-            answer = await ask_ai(channel.id, message.content)
 
-            if "[STAFF_HANDOFF]" in answer:
-                answer = answer.replace("[STAFF_HANDOFF]", "").strip()
-                await channel.send(answer)
+            async with channel.typing():
 
-                if channel.id not in handoff_notified:
-                    mentions = staff_mentions(message.guild)
-                    await channel.send(f"⚠️ **スタッフへの確認が必要です。**\n{mentions}")
-                    handoff_notified.add(channel.id)
-                return
+                answer = await ask_ai(
+                    channel.id,
+                    message.content
+                )
 
-            await channel.send(answer)
+        except Exception:
 
-        except Exception as e:
-            print("AIエラー:", repr(e))
-            await channel.send(
+            logger.exception(
+                "Gemini AI処理エラー: channel_id=%s",
+                channel.id
+            )
+
+            await safe_send(
+                channel,
                 "申し訳ありません。AIの応答でエラーが発生しました。\n"
                 "スタッフに確認を依頼してください。"
             )
+
             if channel.id not in handoff_notified:
+
                 mentions = staff_mentions(message.guild)
-                await channel.send(f"⚠️ **スタッフの対応をお願いします。**\n{mentions}")
+
+                await safe_send(
+                    channel,
+                    f"⚠️ **スタッフの対応をお願いします。**\n{mentions}"
+                )
+
                 handoff_notified.add(channel.id)
 
+            return
+
+        # ==================================
+        # スタッフへの引き継ぎ
+        # ==================================
+
+        if "[STAFF_HANDOFF]" in answer:
+
+            answer = answer.replace(
+                "[STAFF_HANDOFF]",
+                ""
+            ).strip()
+
+            await send_long_message(
+                channel,
+                answer
+            )
+
+            if channel.id not in handoff_notified:
+
+                mentions = staff_mentions(message.guild)
+
+                await safe_send(
+                    channel,
+                    f"⚠️ **スタッフへの確認が必要です。**\n{mentions}"
+                )
+
+                handoff_notified.add(channel.id)
+
+            return
+
+        # 通常回答
+        await send_long_message(
+            channel,
+            answer
+        )
+
+
 # ==========================================
-# 12. Bot起動
+# 16. Discordエラー記録
 # ==========================================
 
-print("Botを起動します...")
-bot.run(DISCORD_TOKEN)
+@bot.event
+async def on_error(event_method, *args, **kwargs):
+
+    logger.exception(
+        "Discordイベントエラー: %s",
+        event_method
+    )
+
+
+# ==========================================
+# 17. Bot起動
+# ==========================================
+
+logger.info("Botを起動します...")
+
+try:
+    bot.run(
+        DISCORD_TOKEN,
+        log_handler=None
+    )
+
+except discord.LoginFailure:
+    logger.critical(
+        "Discordトークンが正しくありません。"
+    )
+    raise
+
+except Exception:
+    logger.exception(
+        "Bot起動中に致命的なエラーが発生しました。"
+    )
+    raise
