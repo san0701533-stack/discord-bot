@@ -1,22 +1,4 @@
 import os
-from flask import Flask
-import threading
-
-app = Flask(__name__)
-
-
-@app.route("/")
-def home():
-  return "Bot is alive!"
-
-
-def run_web():
-  port = int(os.environ.get("PORT", 8080))
-  app.run(host="0.0.0.0", port=port)
-
-
-threading.Thread(target=run_web, daemon=True).start()
-import os
 import re
 import asyncio
 import logging
@@ -59,11 +41,7 @@ def run_web():
     port = int(os.environ.get("PORT", 8080))
     logger.info("Webサーバー起動: port=%s", port)
 
-    serve(
-        app,
-        host="0.0.0.0",
-        port=port
-    )
+    serve(app, host="0.0.0.0", port=port)
 
 
 threading.Thread(
@@ -137,10 +115,8 @@ paused_channels = set()
 histories = {}
 handoff_notified = set()
 
-# AIの同時処理数を制限
 AI_SEMAPHORE = asyncio.Semaphore(2)
 
-# チャンネルごとの処理重複を防止
 channel_locks = defaultdict(asyncio.Lock)
 
 
@@ -455,7 +431,6 @@ async def send_long_message(channel, content):
     if not content:
         return
 
-    # Discordの文字数制限に合わせて分割
     chunks = [
         content[i:i + 1900]
         for i in range(0, len(content), 1900)
@@ -575,7 +550,7 @@ class TicketPanel(discord.ui.View):
                 view=OpenTicketView()
             )
 
-        except discord.HTTPException as e:
+        except discord.HTTPException:
             logger.exception("チケット作成エラー")
 
             if not interaction.response.is_done():
@@ -774,7 +749,6 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    # コマンドを処理
     await bot.process_commands(message)
 
     if message.content.startswith("!"):
@@ -783,7 +757,6 @@ async def on_message(message):
     channel = message.channel
     ticket = is_ticket(channel)
 
-    # チケット内でスタッフが発言したらAIを停止
     if ticket and is_staff(message.author):
         paused_channels.add(channel.id)
         return
@@ -794,11 +767,9 @@ async def on_message(message):
     if channel.id in paused_channels:
         return
 
-    # サーバー外では自動応答しない
     if message.guild is None:
         return
 
-    # チケット外はメンション・返信時だけ反応
     if not ticket:
 
         mentioned = (
@@ -932,7 +903,6 @@ async def on_message(message):
 
             return
 
-        # 通常回答
         await send_long_message(
             channel,
             answer
