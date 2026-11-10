@@ -1,3 +1,4 @@
-discord.py
-google-genai
-flask
+discord.py>=2.4,<3.0
+google-genai>=1.0
+flask>=3.0
+waitress>=3.0
