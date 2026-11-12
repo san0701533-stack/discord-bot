@@ -1,0 +1,48 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "summary", "responses_to_claude", "findings"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["lgtm", "changes_requested"],
+      "description": "lgtm only when findings is empty."
+    },
+    "summary": {
+      "type": "string",
+      "description": "Overall assessment in Japanese, 1-3 sentences."
+    },
+    "responses_to_claude": {
+      "type": "array",
+      "description": "Your reply to each of Claude's decisions from the previous round. Empty in round 1.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["finding_id", "stance", "comment"],
+        "properties": {
+          "finding_id": { "type": "string" },
+          "stance": { "type": "string", "enum": ["agree", "partially_agree", "disagree"] },
+          "comment": { "type": "string" }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "description": "Issues still open after this review. Reuse the previous id for an issue you are keeping open.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "severity", "file", "line", "title", "detail", "suggestion"],
+        "properties": {
+          "id": { "type": "string" },
+          "severity": { "type": "string", "enum": ["high", "medium", "low"] },
+          "file": { "type": "string" },
+          "line": { "type": "integer", "description": "0 if not applicable." },
+          "title": { "type": "string" },
+          "detail": { "type": "string" },
+          "suggestion": { "type": "string" }
+        }
+      }
+    }
+  }
+}
