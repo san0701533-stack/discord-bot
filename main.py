@@ -320,6 +320,22 @@ def get_ticket_owner(channel):
         return None
 
 
+async def fetch_ticket_owner_member(guild, owner_id):
+    """チケット所有者のMemberを取得する（権限設定にはMemberが必要）。"""
+    if guild is None or not owner_id:
+        return None
+
+    member = guild.get_member(owner_id)
+    if member is not None:
+        return member
+
+    try:
+        return await guild.fetch_member(owner_id)
+    except discord.NotFound:
+        # 所有者がサーバーを退出済みの場合、権限変更の対象は存在しない。
+        return None
+
+
 def staff_mentions(guild):
     if guild is None:
         return ""
@@ -1933,10 +1949,12 @@ class OpenTicketView(discord.ui.View):
             return
 
         if owner_id:
-            await channel.set_permissions(
-                discord.Object(id=owner_id),
-                send_messages=False,
-            )
+            owner = await fetch_ticket_owner_member(channel.guild, owner_id)
+            if owner is not None:
+                await channel.set_permissions(
+                    owner,
+                    send_messages=False,
+                )
 
         await interaction.response.send_message(
             "チケットを閉じました。",
@@ -1966,10 +1984,12 @@ class ClosedTicketView(discord.ui.View):
         owner_id = get_ticket_owner(channel)
 
         if owner_id:
-            await channel.set_permissions(
-                discord.Object(id=owner_id),
-                send_messages=True,
-            )
+            owner = await fetch_ticket_owner_member(channel.guild, owner_id)
+            if owner is not None:
+                await channel.set_permissions(
+                    owner,
+                    send_messages=True,
+                )
 
         await interaction.response.send_message(
             "チケットを再開しました。",
