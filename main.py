@@ -225,6 +225,9 @@ bot = SupportBot(
 # ==========================================
 
 order_locks = defaultdict(asyncio.Lock)
+# チケット作成の連打・同時押しで同じ利用者のチケットが複数作られないよう、
+# (サーバーID, ユーザーID) ごとに作成処理を直列化する。
+ticket_create_locks = defaultdict(asyncio.Lock)
 
 
 # ==========================================
@@ -509,6 +512,8 @@ STATUS_FROM_TEXT.setdefault("PayPayリンク転送済み", "link_sent")
 
 # PayPay受け取りフローの二重送信・二重通知防止（プロセス内ガード）
 # ※ 正式な状態はパネルEmbedのフッターで管理し、こちらは補助的なガード。
+# 同じパネルで再注文（キャンセル後の「新しく注文」）された場合に新しい注文を妨げないよう、
+# (パネルのメッセージID, 注文ID) の組で記録する。
 paypay_dm_sent_panels = set()
 paypay_confirmed_panels = set()
 
@@ -1586,6 +1591,12 @@ def _ticket_closed_for(channel, owner_id):
 async def handle_customer_action(interaction, parts):
     message = interaction.message
     channel = interaction.channel
+    # interaction.message は押した時点のスナップショット。連打やスタッフ操作の直後に
+    # 古い状態で処理しないよう、ロック取得後（呼び出し元）に最新のパネルを取り直す。
+    # 取得に失敗した場合は古い状態で続行せず、呼び出し元の例外処理で
+    # 「通信エラーが発生しました。もう一度お試しください。」を案内する。
+    if message is not None and channel is not None:
+        message = await channel.fetch_message(message.id)
     state = parse_order_message(message)
 
     if state is None or not is_ticket(channel):
@@ -1796,7 +1807,7 @@ async def handle_customer_action(interaction, parts):
     await _ephemeral(interaction, "不明な操作です。")
 
 
-def _paypay_dm_view(channel_id, message_id, *, confirmed=False, label=None):
+def _paypay_dm_view(channel_id, message_id, *, confirmed=False, label=None, order_id=None):
     """受け取り先DMに付ける「受け取りました」ボタン。"""
     if confirmed:
         return _view([_button(
@@ -1807,7 +1818,8 @@ def _paypay_dm_view(channel_id, message_id, *, confirmed=False, label=None):
         )])
     return _view([_button(
         "受け取りました",
-        f"ord:p:paypay_recv:{channel_id}:{message_id}",
+        # 注文IDも含め、同じパネルで作り直された別の注文を誤って確認しないようにする
+        f"ord:p:paypay_recv:{channel_id}:{message_id}" + (f":{order_id}" if order_id else ""),
         style=discord.ButtonStyle.success,
         emoji="✅", row=0,
     )])
@@ -1890,7 +1902,7 @@ async def handle_customer_paypay_action(interaction, parts):
                 return await _ephemeral(interaction, "このチケットはクローズされています。")
 
             # 二重送信防止（状態とプロセス内ガードの両方で確認）
-            if message_id in paypay_dm_sent_panels or state["status"] in ("link_sent", "received", "paid", "done"):
+            if (message_id, state["order_id"]) in paypay_dm_sent_panels or state["status"] in ("link_sent", "received", "paid", "done"):
                 return await _ephemeral(interaction, "PayPayリンクはすでに送信済みです。受け取り確認をお待ちください。")
             if not _paypay_link_input_allowed(state):
                 return await _ephemeral(interaction, "この注文ではPayPayリンクを受け付けられません。")
@@ -1928,7 +1940,7 @@ async def handle_customer_paypay_action(interaction, parts):
                     recipient = await bot.fetch_user(PAYPAY_FORWARD_USER_ID)
                 await recipient.send(
                     dm_text,
-                    view=_paypay_dm_view(channel.id, panel.id),
+                    view=_paypay_dm_view(channel.id, panel.id, order_id=state["order_id"]),
                     allowed_mentions=discord.AllowedMentions(users=True),
                 )
             except discord.HTTPException as error:
@@ -1940,7 +1952,7 @@ async def handle_customer_paypay_action(interaction, parts):
                     "時間をおいて「PayPayリンクを入力・送信」から再度お試しいただくか、スタッフにお知らせください。",
                 )
 
-            paypay_dm_sent_panels.add(message_id)
+            paypay_dm_sent_panels.add((message_id, state["order_id"]))
             logger.info("PayPayリンクDM送信: #%s", state["order_id"])
 
             # DM送信成功 → 受け取り確認待ち（スタッフへのメンションはしない）
@@ -1972,6 +1984,8 @@ async def handle_customer_paypay_action(interaction, parts):
             channel_id, message_id = int(parts[3]), int(parts[4])
         except (IndexError, ValueError):
             return await _ephemeral(interaction, "注文情報を読み込めませんでした。")
+        # 注文IDはこの修正以降に送ったDMにだけ含まれる（以前のDMは None）
+        dm_order_id = parts[5] if len(parts) > 5 else None
 
         await interaction.response.defer()
 
@@ -1989,7 +2003,7 @@ async def handle_customer_paypay_action(interaction, parts):
                 return await _ephemeral(interaction, "注文情報を読み込めませんでした。")
 
             # 二重通知防止
-            if message_id in paypay_confirmed_panels or state["status"] in ("received", "paid", "done"):
+            if (message_id, state["order_id"]) in paypay_confirmed_panels or state["status"] in ("received", "paid", "done"):
                 await interaction.edit_original_response(view=_paypay_dm_view(0, 0, confirmed=True))
                 return await _ephemeral(interaction, "この注文はすでに受け取り確認済みです。")
             if state["status"] == "cancelled":
@@ -1997,7 +2011,14 @@ async def handle_customer_paypay_action(interaction, parts):
                     view=_paypay_dm_view(0, 0, confirmed=True, label="注文キャンセル済み"),
                 )
                 return await _ephemeral(interaction, "この注文はキャンセルされています。")
-            if state["status"] != "link_sent" or state["answers"].get("payment") != "paypay":
+            if dm_order_id is not None and dm_order_id != state["order_id"]:
+                return await _ephemeral(interaction, "このDMの注文は、現在のお支払い画面の注文と一致しません。")
+            # このボタンはDM送信に成功した場合にだけ存在する。DM送信後のパネル更新
+            # （link_sent の保存）に失敗して submitted のまま残った注文も、注文IDが
+            # 一致するDMからに限り、ここで復旧できるようにする。
+            allowed_status = ("link_sent", "submitted") if dm_order_id is not None else ("link_sent",)
+            if (state["status"] not in allowed_status
+                    or state["answers"].get("payment") != "paypay"):
                 return await _ephemeral(interaction, "現在の状態では受け取り確認できません。")
 
             # 段階3：受け取り確認済みへ
@@ -2009,7 +2030,7 @@ async def handle_customer_paypay_action(interaction, parts):
                 log_http_error("PayPay受け取り確認の反映", error)
                 return await _ephemeral(interaction, "チケットの更新に失敗しました。もう一度ボタンを押してください。")
 
-            paypay_confirmed_panels.add(message_id)
+            paypay_confirmed_panels.add((message_id, state["order_id"]))
             logger.info("PayPay受け取り確認: #%s by %s", state["order_id"], interaction.user.id)
 
             # ボタン押下後にのみ、チケット内でスタッフへメンション
@@ -2174,83 +2195,98 @@ class TicketPanel(discord.ui.View):
             )
             return
 
-        for channel in guild.text_channels:
-            if is_ticket(channel) and get_ticket_owner(channel) == user.id:
-                await interaction.response.send_message(
-                    f"すでにチケットがあります：{channel.mention}",
-                    ephemeral=True,
-                )
-                return
+        # チャンネル作成は3秒の応答期限を超えることがあるため、先に本人だけに「考え中…」を出す。
+        # 期限切れで応答に失敗すると、ウェルカムメッセージ・受付パネルが送られないチケットが残る。
+        await interaction.response.defer(ephemeral=True, thinking=True)
 
-        try:
-            category = discord.utils.get(guild.categories, name=TICKET_CATEGORY)
-            if category is None:
-                category = await guild.create_category(TICKET_CATEGORY)
+        async with ticket_create_locks[(guild.id, user.id)]:
+            for channel in guild.text_channels:
+                if is_ticket(channel) and get_ticket_owner(channel) == user.id:
+                    await interaction.followup.send(
+                        f"すでにチケットがあります：{channel.mention}",
+                        ephemeral=True,
+                    )
+                    return
 
-            overwrites = {
-                guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                user: discord.PermissionOverwrite(
-                    view_channel=True,
-                    send_messages=True,
-                    read_message_history=True,
-                    attach_files=True,
-                ),
-                guild.me: discord.PermissionOverwrite(
-                    view_channel=True,
-                    send_messages=True,
-                    read_message_history=True,
-                    manage_channels=True,
-                ),
-            }
+            notified = False
+            try:
+                category = discord.utils.get(guild.categories, name=TICKET_CATEGORY)
+                if category is None:
+                    category = await guild.create_category(TICKET_CATEGORY)
 
-            for role_id in STAFF_ROLES:
-                role = guild.get_role(role_id)
-                if role:
-                    overwrites[role] = discord.PermissionOverwrite(
+                overwrites = {
+                    guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                    user: discord.PermissionOverwrite(
+                        view_channel=True,
+                        send_messages=True,
+                        read_message_history=True,
+                        attach_files=True,
+                    ),
+                    guild.me: discord.PermissionOverwrite(
                         view_channel=True,
                         send_messages=True,
                         read_message_history=True,
                         manage_channels=True,
-                    )
+                    ),
+                }
 
-            channel = await guild.create_text_channel(
-                name=f"ticket-{user.name}",
-                category=category,
-                overwrites=overwrites,
-                topic=f"ticket_owner:{user.id}",
-            )
+                for role_id in STAFF_ROLES:
+                    role = guild.get_role(role_id)
+                    if role:
+                        overwrites[role] = discord.PermissionOverwrite(
+                            view_channel=True,
+                            send_messages=True,
+                            read_message_history=True,
+                            manage_channels=True,
+                        )
 
-            await interaction.response.send_message(
-                f"チケットを作成しました：{channel.mention}",
-                ephemeral=True,
-            )
-
-            welcome = discord.Embed(
-                title="お問い合わせありがとうございます",
-                description=(
-                    "下の **受付パネル** のボタンを順番に選ぶだけで、ご注文が完了します。\n"
-                    "料金は料金表に基づいて自動で計算されます。\n\n"
-                    "◆ 内容の変更・戻る・キャンセルはいつでも可能です\n"
-                    "◆ パネルはご本人様のみ操作できます\n"
-                    "◆ 料金表にないご相談はスタッフが個別に対応します"
-                ),
-                color=COLOR_DEEP,
-            )
-            welcome.set_author(name=f"◆ {BRAND_NAME}　｜　SUPPORT")
-            await channel.send(
-                f"{user.mention}",
-                embed=welcome,
-                view=OpenTicketView(),
-            )
-            await send_order_panel(channel, user.id)
-
-        except discord.HTTPException as error:
-            log_http_error("チケット作成", error)
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "チケットの作成に失敗しました。スタッフに確認してください。",
-                    ephemeral=True,
+                channel = await guild.create_text_channel(
+                    name=f"ticket-{user.name}",
+                    category=category,
+                    overwrites=overwrites,
+                    topic=f"ticket_owner:{user.id}",
                 )
+
+                notified = True
+                try:
+                    await interaction.followup.send(
+                        f"チケットを作成しました：{channel.mention}",
+                        ephemeral=True,
+                    )
+                except discord.HTTPException as error:
+                    # 通知に失敗してもチケットの初期化（ウェルカム・受付パネル）は続ける
+                    log_http_error("チケット作成の完了通知", error)
+
+                welcome = discord.Embed(
+                    title="お問い合わせありがとうございます",
+                    description=(
+                        "下の **受付パネル** のボタンを順番に選ぶだけで、ご注文が完了します。\n"
+                        "料金は料金表に基づいて自動で計算されます。\n\n"
+                        "◆ 内容の変更・戻る・キャンセルはいつでも可能です\n"
+                        "◆ パネルはご本人様のみ操作できます\n"
+                        "◆ 料金表にないご相談はスタッフが個別に対応します"
+                    ),
+                    color=COLOR_DEEP,
+                )
+                welcome.set_author(name=f"◆ {BRAND_NAME}　｜　SUPPORT")
+                await channel.send(
+                    f"{user.mention}",
+                    embed=welcome,
+                    view=OpenTicketView(),
+                )
+                await send_order_panel(channel, user.id)
+
+            except discord.HTTPException as error:
+                log_http_error("チケット作成", error)
+                if notified:
+                    return  # 作成完了は通知済み（従来どおり失敗通知は重ねて出さない）
+                try:
+                    await interaction.followup.send(
+                        "チケットの作成に失敗しました。スタッフに確認してください。",
+                        ephemeral=True,
+                    )
+                except discord.HTTPException as notify_error:
+                    log_http_error("チケット作成失敗の通知", notify_error)
 
 
 # ==========================================
@@ -2316,9 +2352,14 @@ class ClosedTicketView(discord.ui.View):
         if owner_id:
             owner = await fetch_ticket_owner_member(channel.guild, owner_id)
             if owner is not None:
+                # クローズ時の set_permissions で閲覧権限なども消えているため、
+                # 作成時と同じ権限をまとめて戻す（送信だけ戻すと顧客が閲覧できない）。
                 await channel.set_permissions(
                     owner,
+                    view_channel=True,
                     send_messages=True,
+                    read_message_history=True,
+                    attach_files=True,
                 )
 
         await interaction.response.send_message(
