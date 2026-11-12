@@ -496,13 +496,26 @@ STATUS_TEXT = {
     "draft": "入力中",
     "payment_select": "支払い方法選択中",
     "submitted": "受付済み",
-    "link_sent": "PayPayリンク転送済み",
+    "link_sent": "PayPay受け取り確認待ち",
+    "received": "PayPay受け取り確認済み",
     "reported": "送金報告済み",
     "paid": "対応中",
     "done": "完了",
     "cancelled": "キャンセル",
 }
 STATUS_FROM_TEXT = {v: k for k, v in STATUS_TEXT.items()}
+# 旧バージョンのパネル表記も読めるようにしておく
+STATUS_FROM_TEXT.setdefault("PayPayリンク転送済み", "link_sent")
+
+# PayPay受け取りフローの二重送信・二重通知防止（プロセス内ガード）
+# ※ 正式な状態はパネルEmbedのフッターで管理し、こちらは補助的なガード。
+paypay_dm_sent_panels = set()
+paypay_confirmed_panels = set()
+
+
+def mask_paypay_link(_link=None):
+    """チケット上に表示するための伏せ字。リンクの一部も出さない。"""
+    return "`●●●●●●●●●●（伏せ字）`"
 
 FIELD_LABELS = {
     "category": "区分",
@@ -812,6 +825,7 @@ def _status_header(state):
         "payment_select": 0,
         "submitted": 0,
         "link_sent": 1,
+        "received": 1,
         "reported": 1,
         "paid": 2,
         "done": 3,
@@ -1171,7 +1185,7 @@ def render_status(state):
         body = (
             f"### お支払い金額　¥{price:,}\n"
             "この画面はお支払い専用です。ご希望の方法を選択してください。\n\n"
-            "💳 **PayPay**　お客様が専用フォームからリンクを送信すると、Botが指定アカウントへDM転送します。\n"
+            "💳 **PayPay**　選択すると受け取りリンクの入力画面が開きます。リンクはチケットに表示されません。\n"
             "🪙 **LTC（仮想通貨）**　送金先アドレスを表示します。送金後はお客様ご自身で報告してください。"
         )
         items.extend([
@@ -1203,8 +1217,9 @@ def render_status(state):
             body = (
                 f"### お支払い金額　¥{price:,}\n"
                 "**お支払い方法：PayPay**\n\n"
-                "下の専用入力フォームにPayPayリンクを入力してください。\n"
-                "送信されたリンクは指定アカウントのDMにのみ転送され、チケットにはリンク自体を表示しません。"
+                "下の「PayPayリンクを入力・送信」ボタンから、PayPay受け取りリンクを入力してください。\n"
+                "送信されたリンクは指定アカウントのDMにのみ転送され、チケットにはリンク自体を表示しません。\n\n"
+                "※ リンクはチャット欄に直接貼らず、必ず専用フォームから送信してください。"
             )
             items.append(_button(
                 "PayPayリンクを入力・送信", "ord:p:paypay_open",
@@ -1213,11 +1228,20 @@ def render_status(state):
         items.append(_button("注文を取り消す", "ord:cancel:pay", emoji="✖️", row=1))
 
     elif status == "link_sent":
-        title = "PayPayリンクを転送しました"
+        title = "PayPayの受け取り確認中です"
         body = (
-            "PayPay受け取りリンクを検知し、指定の管理アカウントへDMで転送しました。\n"
-            "リンクはチケット上では伏せ字になっています。\n"
-            "お支払い完了後、スタッフの確認をお待ちください。"
+            "PayPay受け取りリンクを受け付け、担当アカウントへ送信しました。\n"
+            f"リンク：{mask_paypay_link()}\n\n"
+            "現在、担当者が受け取りを確認しています。\n"
+            "受け取りが確認されると、スタッフが次の対応へ進みます。しばらくお待ちください。"
+        )
+        color = COLOR_GLOW
+
+    elif status == "received":
+        title = "PayPayの受け取りを確認しました"
+        body = (
+            "担当者がPayPayの受け取りを確認しました。\n"
+            "スタッフが対応を開始するまで、しばらくお待ちください。"
         )
         color = COLOR_GLOW
 
@@ -1473,7 +1497,15 @@ def staff_view(state, channel_id, message_id):
                 emoji="⏳", row=0, disabled=True,
             ))
         items.append(_button("注文取消", f"ord:s:cancel:{suffix}", emoji="✖️", row=1))
-    elif status in ("link_sent", "reported") or (status == "submitted" and is_cheat):
+    elif status == "link_sent":
+        # DM送信済みだが、受け取り先ユーザーの確認はまだ。対応開始はさせない。
+        items.append(_button(
+            "PayPay受け取り確認待ち",
+            f"ord:s:noop:{suffix}",
+            emoji="⏳", row=0, disabled=True,
+        ))
+        items.append(_button("注文取消", f"ord:s:cancel:{suffix}", emoji="✖️", row=1))
+    elif status in ("received", "reported") or (status == "submitted" and is_cheat):
         items.append(_button(
             "対応開始" if is_cheat else "入金確認・対応開始",
             f"ord:s:paid:{suffix}",
@@ -1692,19 +1724,15 @@ async def handle_customer_action(interaction, parts):
         payment = parts[2] if len(parts) > 2 else None
         if state["status"] != "payment_select" or payment not in PAYMENT_LABELS:
             return await _ephemeral(interaction, "この画面では支払い方法を選択できません。")
+        if payment == "paypay":
+            # PayPay選択だけでは処理を完了させず、すぐに受け取りリンクの入力画面を開く。
+            # 状態の更新・スタッフ通知はリンク送信後の段階で行う（ここでは通知しない）。
+            await interaction.response.send_modal(PayPayLinkModal(channel.id, message.id))
+            return
         state["answers"]["payment"] = payment
         state["status"] = "submitted"
         await _show(interaction, state)
-        if payment == "paypay":
-            await notify_staff(
-                interaction.guild, channel, message, state,
-                "💳 PayPayリンク入力待ち",
-            )
-            await safe_send(
-                channel,
-                f"<@{owner_id}> PayPayを選択しました。専用入力フォームからPayPayリンクを送信してください。",
-            )
-        else:
+        if payment == "ltc":
             await safe_send(
                 channel,
                 f"<@{owner_id}> LTC送金先アドレスを表示しました。送金後、専用画面の「はい、送金しました」を押してください。",
@@ -1750,7 +1778,8 @@ async def handle_customer_action(interaction, parts):
             return await _ephemeral(interaction, "現在の状態ではキャンセルできません。")
         state["status"] = "cancelled"
         await _show(interaction, state)
-        if previous == "submitted":
+        # PayPayのリンク入力待ち段階はスタッフへ未通知のため、取消通知も送らない
+        if previous == "submitted" and state["answers"].get("payment") != "paypay":
             await notify_staff(interaction.guild, channel, message, state, "✖️ お客様が注文を取り消しました")
         return
 
@@ -1767,73 +1796,237 @@ async def handle_customer_action(interaction, parts):
     await _ephemeral(interaction, "不明な操作です。")
 
 
+def _paypay_dm_view(channel_id, message_id, *, confirmed=False, label=None):
+    """受け取り先DMに付ける「受け取りました」ボタン。"""
+    if confirmed:
+        return _view([_button(
+            label or "受け取り確認済み",
+            "ord:p:noop",
+            style=discord.ButtonStyle.success,
+            emoji="✅", row=0, disabled=True,
+        )])
+    return _view([_button(
+        "受け取りました",
+        f"ord:p:paypay_recv:{channel_id}:{message_id}",
+        style=discord.ButtonStyle.success,
+        emoji="✅", row=0,
+    )])
+
+
+async def _fetch_ticket_panel(channel_id, message_id):
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        channel = await bot.fetch_channel(channel_id)
+    if not is_ticket(channel):
+        return channel, None
+    try:
+        panel = await channel.fetch_message(message_id)
+    except discord.NotFound:
+        return channel, None
+    return channel, panel
+
+
+def _paypay_link_input_allowed(state):
+    """PayPayリンクを受け付けてよい状態か（支払い方法選択中 or PayPayリンク入力待ち）。"""
+    if state is None or state["answers"].get("category") != "boost":
+        return False
+    if state["status"] == "payment_select":
+        return True
+    return state["status"] == "submitted" and state["answers"].get("payment") == "paypay"
+
+
 async def handle_customer_paypay_action(interaction, parts):
-    """客専用PayPay入力フォーム。リンクはチケット投稿せず指定IDへDM転送する。"""
+    """PayPay受け取りフロー。
+
+    段階：
+      1. 支払い方法でPayPay選択 → 入力フォーム（モーダル）表示
+      2. リンク入力 → 検知 → 指定ユーザーへDM（メンション付き・確認ボタン付き）
+         ※ この段階ではスタッフにメンションしない（状態：link_sent）
+      3. DM受信者が「受け取りました」を押す → チケット内でスタッフにメンション（状態：received）
+    """
     action = parts[2] if len(parts) > 2 else ""
+
+    # ---- 入力フォームを開く（リンク入力待ち画面のボタン） ----
     if action == "paypay_open":
         message = interaction.message
         state = parse_order_message(message)
-        if (state is None or not is_ticket(interaction.channel)
+        if (not is_ticket(interaction.channel)
+                or state is None
                 or interaction.user.id != state.get("owner_id")
-                or state.get("status") != "submitted"
-                or state.get("answers", {}).get("payment") != "paypay"):
+                or not _paypay_link_input_allowed(state)):
             return await _ephemeral(interaction, "この注文ではPayPayリンクを入力できません。")
         if _ticket_closed_for(interaction.channel, state["owner_id"]):
             return await _ephemeral(interaction, "このチケットはクローズされています。")
         await interaction.response.send_modal(PayPayLinkModal(interaction.channel.id, message.id))
         return
 
+    # ---- リンク送信（モーダル送信） ----
     if action == "paypay_submit":
         try:
             channel_id, message_id = int(parts[3]), int(parts[4])
         except (IndexError, ValueError):
             return await _ephemeral(interaction, "注文情報を読み込めませんでした。")
-        raw_link = clean_text(modal_values(interaction.data).get("paypay_url"), 300)
-        match = PAYPAY_URL_RE.fullmatch(raw_link)
-        if not match:
-            return await _ephemeral(interaction, "PayPayリンクの形式が正しくありません。pay.paypay.ne.jp のリンクを入力してください。")
-        link = match.group(0)
-        channel = bot.get_channel(channel_id)
-        if channel is None:
-            channel = await bot.fetch_channel(channel_id)
-        if not is_ticket(channel):
-            return await _ephemeral(interaction, "チケットを確認できませんでした。")
-        try:
-            panel = await channel.fetch_message(message_id)
-        except discord.NotFound:
-            return await _ephemeral(interaction, "お支払い画面が見つかりません。")
-        state = parse_order_message(panel)
-        if (state is None or interaction.user.id != state.get("owner_id")
-                or state.get("status") != "submitted"
-                or state.get("answers", {}).get("payment") != "paypay"):
-            return await _ephemeral(interaction, "この注文ではPayPayリンクを受け付けられません。")
-        if _ticket_closed_for(channel, state["owner_id"]):
-            return await _ephemeral(interaction, "このチケットはクローズされています。")
-        await interaction.response.defer(ephemeral=True)
-        try:
-            recipient = bot.get_user(PAYPAY_FORWARD_USER_ID)
-            if recipient is None:
-                recipient = await bot.fetch_user(PAYPAY_FORWARD_USER_ID)
-            await recipient.send(
-                "PayPay受け取りリンクです。\n"
-                f"チケット：{channel.mention}\n"
-                f"注文ID：#{state['order_id']}\n"
-                f"送信者ID：{interaction.user.id}\n"
-                f"{link}"
-            )
-        except discord.HTTPException as error:
-            log_http_error("PayPayリンクのDM送信", error)
-            return await _ephemeral(interaction, "DM送信に失敗しました。リンクは転送されていません。送信先のDM設定を確認してください。")
 
-        state["status"] = "link_sent"
-        embed, view = render_panel(state)
+        raw_link = clean_text(modal_values(interaction.data).get("paypay_url"), 300)
+        match = PAYPAY_URL_RE.search(raw_link)
+        if not match:
+            return await _ephemeral(
+                interaction,
+                "PayPay受け取りリンクの形式が正しくありません。`https://pay.paypay.ne.jp/...` のリンクを入力してください。",
+            )
+        link = match.group(0)
+
+        await interaction.response.defer(ephemeral=True)
+
+        async with order_locks[message_id]:
+            channel, panel = await _fetch_ticket_panel(channel_id, message_id)
+            if panel is None:
+                return await _ephemeral(interaction, "お支払い画面が見つかりません。スタッフにお知らせください。")
+
+            state = parse_order_message(panel)
+            if state is None or interaction.user.id != state.get("owner_id"):
+                return await _ephemeral(interaction, "この注文ではPayPayリンクを受け付けられません。")
+            if _ticket_closed_for(channel, state["owner_id"]):
+                return await _ephemeral(interaction, "このチケットはクローズされています。")
+
+            # 二重送信防止（状態とプロセス内ガードの両方で確認）
+            if message_id in paypay_dm_sent_panels or state["status"] in ("link_sent", "received", "paid", "done"):
+                return await _ephemeral(interaction, "PayPayリンクはすでに送信済みです。受け取り確認をお待ちください。")
+            if not _paypay_link_input_allowed(state):
+                return await _ephemeral(interaction, "この注文ではPayPayリンクを受け付けられません。")
+
+            # 段階1：PayPay選択を確定し「リンク入力待ち」にする（DM失敗時はこの画面に留まる）
+            if state["status"] == "payment_select":
+                state["answers"]["payment"] = "paypay"
+                state["status"] = "submitted"
+                embed, view = render_panel(state)
+                try:
+                    await panel.edit(embed=embed, view=view)
+                except discord.HTTPException as error:
+                    log_http_error("PayPay選択の反映", error)
+                    return await _ephemeral(interaction, "お支払い画面を更新できませんでした。もう一度お試しください。")
+
+            # 段階2：指定ユーザーへDM送信（メンション付き・確認ボタン付き）
+            price = order_quote(state)
+            dm_text = (
+                f"<@{PAYPAY_FORWARD_USER_ID}>\n"
+                "💳 **PayPay受け取りリンクが届きました**\n"
+                f"注文ID：#{state['order_id']}\n"
+            )
+            if price is not None:
+                dm_text += f"金額：¥{price:,}\n"
+            dm_text += (
+                f"チケット：{channel.mention}（{channel.name}）\n"
+                f"お客様：<@{state['owner_id']}>（ID: {state['owner_id']}）\n"
+                f"リンク：{link}\n\n"
+                "**受け取りましたか？**\n"
+                "受け取りが完了したら、下の「受け取りました」ボタンを押してください。"
+            )
+            try:
+                recipient = bot.get_user(PAYPAY_FORWARD_USER_ID)
+                if recipient is None:
+                    recipient = await bot.fetch_user(PAYPAY_FORWARD_USER_ID)
+                await recipient.send(
+                    dm_text,
+                    view=_paypay_dm_view(channel.id, panel.id),
+                    allowed_mentions=discord.AllowedMentions(users=True),
+                )
+            except discord.HTTPException as error:
+                log_http_error("PayPayリンクのDM送信", error)
+                # DM失敗時は受け取り確認待ちに進めない（状態は「リンク入力待ち」のまま）
+                return await _ephemeral(
+                    interaction,
+                    "⚠️ リンクの送信に失敗しました。リンクは転送されていません。\n"
+                    "時間をおいて「PayPayリンクを入力・送信」から再度お試しいただくか、スタッフにお知らせください。",
+                )
+
+            paypay_dm_sent_panels.add(message_id)
+            logger.info("PayPayリンクDM送信: #%s", state["order_id"])
+
+            # DM送信成功 → 受け取り確認待ち（スタッフへのメンションはしない）
+            state["status"] = "link_sent"
+            embed, view = render_panel(state)
+            try:
+                await panel.edit(embed=embed, view=view)
+            except discord.HTTPException as error:
+                log_http_error("PayPay送信後の画面更新", error)
+            await safe_send(
+                channel,
+                f"💳 <@{state['owner_id']}> PayPay受け取りリンクを受け付けました。\n"
+                f"リンク：{mask_paypay_link()}\n"
+                "現在、担当者が受け取りを確認しています。確認が取れ次第スタッフが対応しますので、しばらくお待ちください。",
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
+
+        return await _ephemeral(
+            interaction,
+            "PayPay受け取りリンクを送信しました。チケットにはリンクを表示していません。受け取り確認をお待ちください。",
+        )
+
+    # ---- DM：「受け取りました」ボタン ----
+    if action == "paypay_recv":
+        # DMを受け取った本人だけが押せる
+        if interaction.user.id != PAYPAY_FORWARD_USER_ID:
+            return await _ephemeral(interaction, "このボタンはPayPayリンクの受け取り先ご本人のみ操作できます。")
         try:
-            await panel.edit(embed=embed, view=view)
-            await notify_staff(interaction.guild, channel, panel, state, "💳 お客様のPayPayリンク入力・DM転送完了")
-            await safe_send(channel, f"💳 <@{state['owner_id']}> PayPayリンクを受け付けました。指定アカウントへDM転送済みです。リンク自体はチケットに表示していません。")
-        except discord.HTTPException as error:
-            log_http_error("PayPay転送後の画面更新・スタッフ通知", error)
-        return await _ephemeral(interaction, "PayPayリンクを指定アカウントのDMへ送信しました。チケットにはリンクを表示していません。")
+            channel_id, message_id = int(parts[3]), int(parts[4])
+        except (IndexError, ValueError):
+            return await _ephemeral(interaction, "注文情報を読み込めませんでした。")
+
+        await interaction.response.defer()
+
+        async with order_locks[message_id]:
+            try:
+                channel, panel = await _fetch_ticket_panel(channel_id, message_id)
+            except discord.HTTPException as error:
+                log_http_error("PayPay受け取り確認：チケット取得", error)
+                channel, panel = None, None
+            if panel is None:
+                return await _ephemeral(interaction, "対象のチケットまたはお支払い画面が見つかりません。")
+
+            state = parse_order_message(panel)
+            if state is None:
+                return await _ephemeral(interaction, "注文情報を読み込めませんでした。")
+
+            # 二重通知防止
+            if message_id in paypay_confirmed_panels or state["status"] in ("received", "paid", "done"):
+                await interaction.edit_original_response(view=_paypay_dm_view(0, 0, confirmed=True))
+                return await _ephemeral(interaction, "この注文はすでに受け取り確認済みです。")
+            if state["status"] == "cancelled":
+                await interaction.edit_original_response(
+                    view=_paypay_dm_view(0, 0, confirmed=True, label="注文キャンセル済み"),
+                )
+                return await _ephemeral(interaction, "この注文はキャンセルされています。")
+            if state["status"] != "link_sent" or state["answers"].get("payment") != "paypay":
+                return await _ephemeral(interaction, "現在の状態では受け取り確認できません。")
+
+            # 段階3：受け取り確認済みへ
+            state["status"] = "received"
+            embed, view = render_panel(state)
+            try:
+                await panel.edit(embed=embed, view=view)
+            except discord.HTTPException as error:
+                log_http_error("PayPay受け取り確認の反映", error)
+                return await _ephemeral(interaction, "チケットの更新に失敗しました。もう一度ボタンを押してください。")
+
+            paypay_confirmed_panels.add(message_id)
+            logger.info("PayPay受け取り確認: #%s by %s", state["order_id"], interaction.user.id)
+
+            # ボタン押下後にのみ、チケット内でスタッフへメンション
+            mentions = staff_mentions(channel.guild)
+            staff_embed = build_staff_embed(
+                state, channel, "✅ PayPay受け取り確認済み", panel.jump_url, interaction.user,
+            )
+            await safe_send(
+                channel,
+                f"✅ **PayPayの受け取りが確認されました。対応をお願いします。** {mentions}".strip(),
+                embed=staff_embed,
+                view=staff_view(state, channel.id, panel.id),
+            )
+
+            await interaction.edit_original_response(view=_paypay_dm_view(0, 0, confirmed=True))
+
+        return await _ephemeral(interaction, "受け取り確認を記録し、スタッフへ通知しました。")
 
     return await _ephemeral(interaction, "不明な操作です。")
 
@@ -1852,9 +2045,10 @@ async def handle_staff_action(interaction, parts):
         return
 
     transitions = {
-        "paid": ({"submitted", "link_sent", "reported"}, "paid"),
+        # PayPayは受け取り先ユーザーが「受け取りました」を押した後（received）のみ対応開始可
+        "paid": ({"submitted", "received", "reported"}, "paid"),
         "done": ({"paid"}, "done"),
-        "cancel": ({"draft", "payment_select", "submitted", "link_sent", "reported", "paid"}, "cancelled"),
+        "cancel": ({"draft", "payment_select", "submitted", "link_sent", "received", "reported", "paid"}, "cancelled"),
     }
     if action not in transitions:
         await _ephemeral(interaction, "不明な操作です。")
@@ -1884,6 +2078,9 @@ async def handle_staff_action(interaction, parts):
             and state["answers"].get("category") == "boost"
         ):
             await _ephemeral(interaction, "お客様のお支払い手続きが完了するまで、対応開始はできません。")
+            return
+        if action == "paid" and state["status"] == "link_sent":
+            await _ephemeral(interaction, "PayPayの受け取り確認がまだ完了していません。受け取り先の確認をお待ちください。")
             return
         if state["status"] not in allowed:
             await _ephemeral(
@@ -2214,6 +2411,24 @@ async def order_panel(ctx):
 @bot.event
 async def on_message(message):
     # PayPayリンクは専用モーダルで受け付ける（通常メッセージでは受け付けない）。
+    # チケットにリンクが直接貼られた場合は、表示させないよう削除して伏せ字で案内する。
+    if (not message.author.bot
+            and is_ticket(message.channel)
+            and PAYPAY_URL_RE.search(message.content or "")):
+        try:
+            await message.delete()
+            await safe_send(
+                message.channel,
+                f"{message.author.mention} PayPayリンク {mask_paypay_link()} を検知したため、"
+                "安全のためメッセージを削除しました。\n"
+                "リンクはチャットに貼らず、お支払い画面の「PayPay」→ 専用入力フォームから送信してください。",
+                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+            )
+        except discord.Forbidden:
+            logger.warning("PayPayリンクを含むメッセージを削除できませんでした（メッセージ管理権限が必要です）。")
+        except discord.HTTPException as error:
+            log_http_error("PayPayリンクを含むメッセージの削除", error)
+        return
     await bot.process_commands(message)
 
 
