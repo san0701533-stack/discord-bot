@@ -14,7 +14,6 @@ import discord
 from discord.ext import commands
 from flask import Flask
 from waitress import serve
-from google import genai
 
 
 # ==========================================
@@ -146,15 +145,8 @@ threading.Thread(target=run_web, daemon=True).start()
 # ==========================================
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-AI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-
 if not DISCORD_TOKEN:
     raise ValueError("DISCORD_TOKENが設定されていません。")
-
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEYが設定されていません。")
 
 
 STAFF_ROLES = [
@@ -229,18 +221,9 @@ bot = SupportBot(
 
 
 # ==========================================
-# 5. Gemini設定
+# 5. 注文処理ロック
 # ==========================================
 
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
-
-ai_enabled = True
-paused_channels = set()
-histories = {}
-handoff_notified = set()
-
-AI_SEMAPHORE = asyncio.Semaphore(2)
-channel_locks = defaultdict(asyncio.Lock)
 order_locks = defaultdict(asyncio.Lock)
 
 
@@ -453,91 +436,6 @@ def trophy_goal_options(start):
 
 
 # ==========================================
-# 9. Gemini AI
-# ==========================================
-
-SYSTEM_PROMPT = """
-あなたはブロスタの代行サービスを案内するDiscordサポートAIです。
-
-必ず日本語で、丁寧かつ分かりやすく回答してください。
-
-【重要なルール】
-
-1. 分からないことを絶対に作らない。
-2. 料金表にない金額を勝手に計算しない。
-3. 支払いが完了したかどうかを勝手に判断しない。
-4. アカウントのパスワードや認証コードを要求しない。
-5. 返金、トラブル、クレーム、支払い確認はスタッフに引き継ぐ。
-6. 判断できない内容はすぐにスタッフへ引き継ぐ。
-7. チートの配布・導入方法などの案内はしない。問い合わせはスタッフへ引き継ぐ。
-8. 注文はチケット作成後に表示されるボタン式の受付パネルから行うよう案内する。
-
-【ガチバトル料金】
-
-エリート1〜レジェンド1：900円
-レジェンド1〜マスター1：4200円
-レジェンド2〜マスター1：3200円
-レジェンド3〜マスター1：2000円
-マスター1〜マスター2：8000円
-マスター2〜マスター3：20000円
-マスター3〜プロ：40000円
-
-【トロ上げ料金】
-
-0〜1000：300円
-1000〜2000：700円
-2000〜3000：15000円
-2500〜3000：8499円
-
-2000〜2500は料金未設定です。
-料金表にない区間はスタッフに確認してください。
-
-【スタッフへの引き継ぎ】
-
-対応できない場合は、回答の先頭に必ず
-[STAFF_HANDOFF]
-と付けてください。
-
-特に料金不明、例外、支払い、トラブル、チート関連の相談は
-すぐにスタッフへ引き継いでください。
-
-スタッフに確認する必要がある場合は、
-ユーザーに「スタッフに確認します」と伝えてください。
-"""
-
-
-async def ask_ai(channel_id, user_message):
-    async with AI_SEMAPHORE:
-        history = histories.get(channel_id, [])
-
-        chat_history_text = SYSTEM_PROMPT + "\n\n【これまでの会話】\n"
-
-        for h in history[-10:]:
-            role_name = "ユーザー" if h["role"] == "user" else "AI"
-            chat_history_text += f"{role_name}: {h['content']}\n"
-
-        chat_history_text += f"ユーザー: {user_message}\nAI:"
-
-        response = await asyncio.to_thread(
-            ai_client.models.generate_content,
-            model=AI_MODEL,
-            contents=chat_history_text,
-        )
-
-        answer = response.text
-        if not answer:
-            raise ValueError("Geminiから空の回答が返されました。")
-
-        answer = answer.strip()
-
-        history.append({"role": "user", "content": user_message})
-        history.append({"role": "assistant", "content": answer})
-        histories[channel_id] = history[-16:]
-
-        return answer
-
-
-# ==========================================
 # 10. Discord送信処理
 # ==========================================
 
@@ -588,12 +486,18 @@ EMPTY = "―"
 
 CATEGORY_LABELS = {"boost": "代行", "cheat": "チート"}
 SERVICE_LABELS = {"trophy": "トロ上げ代行", "ranked": "ガチバ代行"}
+PAYMENT_LABELS = {"paypay": "PayPay", "ltc": "LTC（仮想通貨）"}
+LTC_ADDRESS = "LbuHqe7Uy5NgqGYi2AT544aY41CcYiSMcs"
+PAYPAY_FORWARD_USER_ID = 1462791798891090084
+PAYPAY_URL_RE = re.compile(r"https?://pay\.paypay\.ne\.jp/[A-Za-z0-9_-]+", re.IGNORECASE)
 DEVICE_LABELS = {"ios": "iOS", "android": "Android"}
 
 STATUS_TEXT = {
     "draft": "入力中",
+    "payment_select": "支払い方法選択中",
     "submitted": "受付済み",
-    "reported": "入金報告済み",
+    "link_sent": "PayPayリンク転送済み",
+    "reported": "送金報告済み",
     "paid": "対応中",
     "done": "完了",
     "cancelled": "キャンセル",
@@ -607,6 +511,7 @@ FIELD_LABELS = {
     "goal": "目標",
     "tag": "プレイヤータグ",
     "brawler": "対象キャラ",
+    "payment": "お支払い方法",
     "note": "備考",
     "device": "端末",
     "detail": "相談内容",
@@ -623,7 +528,8 @@ def step_title(state, step):
         "service": "サービス",
         "start": "現在のトロフィー" if service == "trophy" else "現在のランク",
         "goal": "目標のトロフィー" if service == "trophy" else "目標のランク",
-        "info": "アカウント情報",
+        "info": "追加情報",
+        "payment": "お支払い方法",
         "device": "ご利用端末",
         "detail": "ご相談内容",
         "confirm": "最終確認",
@@ -651,7 +557,11 @@ def step_sequence(state):
     if answers.get("category") == "cheat":
         seq += ["device", "detail"]
     elif answers.get("category") == "boost":
-        seq += ["service", "start", "goal", "info"]
+        seq += ["service", "start", "goal"]
+        # ガチバ代行は現在ランク・目標ランクの入力後に注文内容を確定し、
+        # 支払い方法は別メッセージの専用UIで選択する。
+        if answers.get("service") == "trophy":
+            seq += ["info"]
     seq.append("confirm")
     return seq
 
@@ -679,6 +589,8 @@ def step_done(state, step):
     if step == "goal":
         return order_quote(state) is not None
     if step == "info":
+        if answers.get("service") == "ranked":
+            return True
         return bool(answers.get("tag"))
     if step == "device":
         return answers.get("device") in DEVICE_LABELS
@@ -743,6 +655,8 @@ def display_value(state, key):
         return SERVICE_LABELS.get(value)
     if key == "device":
         return DEVICE_LABELS.get(value)
+    if key == "payment":
+        return PAYMENT_LABELS.get(value)
     if key in ("start", "goal"):
         if answers.get("service") == "trophy":
             return f"{value:,} トロ"
@@ -759,6 +673,8 @@ def decode_value(key, text, service):
         return {v: k for k, v in SERVICE_LABELS.items()}.get(text)
     if key == "device":
         return {v: k for k, v in DEVICE_LABELS.items()}.get(text)
+    if key == "payment":
+        return {v: k for k, v in PAYMENT_LABELS.items()}.get(text)
     if key in ("start", "goal"):
         if service == "trophy":
             digits = re.sub(r"\D", "", text)
@@ -776,10 +692,10 @@ def summary_keys(state):
         keys = ["category", "service"]
         service = answers.get("service")
         if service:
-            keys += ["start", "goal", "tag"]
+            keys += ["start", "goal"]
             if service == "trophy":
-                keys.append("brawler")
-            keys.append("note")
+                keys += ["tag", "brawler"]
+            keys += ["note", "payment"]
         return keys
     return ["category"]
 
@@ -893,7 +809,9 @@ def _status_header(state):
         else ["注文受付", "入金確認", "対応中", "完了"]
     )
     reached = {
+        "payment_select": 0,
         "submitted": 0,
+        "link_sent": 1,
         "reported": 1,
         "paid": 2,
         "done": 3,
@@ -1109,17 +1027,16 @@ def render_step(state, step, ret="n"):
     elif step == "info":
         trophy = answers.get("service") == "trophy"
         title = f"{prefix}アカウント情報を入力してください"
-        lines = [
-            "下のボタンから入力フォームを開いてください。\n",
-            "◆ **プレイヤータグ**（必須）　例：`#ABC123`",
-        ]
+        lines = ["下のボタンから追加情報を入力してください。\n"]
         if trophy:
+            lines.append("◆ **プレイヤータグ**（必須）　例：`#ABC123`")
             lines.append("◆ **対象キャラ**（任意）")
+        else:
+            lines.append("◆ **プレイヤータグの入力は不要です**")
         lines += [
             "◆ **備考**（任意）　希望納期など",
             "",
             "🔐 パスワードや認証コードは**入力しないでください**。",
-            "　└ 必要な手続きはスタッフから個別にご案内します。",
         ]
         body = "\n".join(lines)
         done = step_done(state, step)
@@ -1131,6 +1048,22 @@ def render_step(state, step, ret="n"):
             row=0,
         ))
         show_next = done
+
+    elif step == "payment":
+        title = f"{prefix}お支払い方法を選択してください"
+        body = (
+            "ご希望のお支払い方法を選んでください。\n\n"
+            "💳 **PayPay**\n　└ お客様が専用フォームからリンクを送信します\n"
+            "🪙 **LTC（仮想通貨）**\n　└ 指定のLTCアドレスをご案内します"
+        )
+        selected = answers.get("payment")
+        items += [
+            _button("PayPay", f"ord:set:payment:paypay:{ret}", emoji="💳", row=0,
+                    style=_choice_style(selected, "paypay", True)),
+            _button("LTC（仮想通貨）", f"ord:set:payment:ltc:{ret}", emoji="🪙", row=0,
+                    style=_choice_style(selected, "ltc", True)),
+        ]
+        show_next = step_done(state, step)
 
     elif step == "device":
         title = f"{prefix}ご利用の端末を選択してください"
@@ -1184,8 +1117,8 @@ def render_confirm(state):
         title = "ご注文内容の最終確認"
         body = (
             "以下の内容でお間違いなければ **注文を確定** を押してください。\n\n"
-            f"### お支払い金額　¥{price:,}\n"
-            "確定後、PayPayでのお支払い方法をご案内します。"
+            f"### お見積り金額　¥{price:,}\n"
+            "注文確定後、お支払い専用の画面を別に表示します。"
         )
         submit_label = "注文を確定"
 
@@ -1193,7 +1126,7 @@ def render_confirm(state):
     for step in step_sequence(state)[:-1]:
         current = None
         if step == "info":
-            current = display_value(state, "tag")
+            current = display_value(state, "tag") or display_value(state, "note")
         elif step in FIELD_LABELS:
             current = display_value(state, step)
         options.append(discord.SelectOption(
@@ -1232,31 +1165,61 @@ def render_status(state):
     items = []
     color = COLOR_MAIN
 
-    if status == "submitted" and not is_cheat:
+    if status == "payment_select" and not is_cheat:
         price = order_quote(state)
-        link = paypay_link_for(price)
-        title = "ご注文を受け付けました ─ お支払いのご案内"
-        steps = []
-        if link:
-            steps.append(f"**1.** 下の **PayPayで支払う** から **¥{price:,}** を送金")
-        else:
-            steps.append(f"**1.** スタッフがお送りするPayPayリンクから **¥{price:,}** を送金")
-        steps += [
-            f"**2.** 送金メッセージに注文ID **`#{oid}`** を記入",
-            "**3.** 送金後、**支払いを報告** を押してください",
-        ]
+        title = "お支払い専用メニュー"
         body = (
             f"### お支払い金額　¥{price:,}\n"
-            + "\n".join(steps)
-            + "\n\n※ 入金の確認はスタッフが行います。確認後に対応を開始します。"
+            "この画面はお支払い専用です。ご希望の方法を選択してください。\n\n"
+            "💳 **PayPay**　お客様が専用フォームからリンクを送信すると、Botが指定アカウントへDM転送します。\n"
+            "🪙 **LTC（仮想通貨）**　送金先アドレスを表示します。送金後はお客様ご自身で報告してください。"
         )
-        if link:
-            items.append(_button("PayPayで支払う", url=link, emoji="💳", row=0))
-        items += [
-            _button("支払いを報告", "ord:report", style=discord.ButtonStyle.primary,
-                    emoji="💸", row=0),
-            _button("注文を取り消す", "ord:cancel:pay", emoji="✖️", row=1),
-        ]
+        items.extend([
+            _button("PayPay", "ord:pay:paypay", style=discord.ButtonStyle.primary, emoji="💳", row=0),
+            _button("LTC（仮想通貨）", "ord:pay:ltc", style=discord.ButtonStyle.secondary, emoji="🪙", row=0),
+            _button("注文を取り消す", "ord:cancel:payment", emoji="✖️", row=1),
+        ])
+
+    elif status == "submitted" and not is_cheat:
+        price = order_quote(state)
+        payment = state["answers"].get("payment")
+        title = "お見積り・お支払いのご案内"
+        if payment == "ltc":
+            body = (
+                f"### お支払い金額　¥{price:,}\n"
+                "**お支払い方法：LTC（仮想通貨）**\n\n"
+                "下記のアドレスにLTCで送金してください。\n"
+                f"```\n{LTC_ADDRESS}\n```\n"
+                "送金先アドレス `LbuHqe7Uy5NgqGYi2AT544aY41CcYiSMcs` を一文字も間違えずに送金しましたか？\n"
+                "送金が完了したら、下の「はい、送金しました」を押してください。\n\n"
+                "※ スタッフが送金状況を確認します。"
+            )
+            items.append(_button("LTCアドレスを表示", "ord:copy:ltc", emoji="📋", row=0))
+            items.append(_button(
+                "はい、送金しました", "ord:report",
+                style=discord.ButtonStyle.primary, emoji="✅", row=0,
+            ))
+        else:
+            body = (
+                f"### お支払い金額　¥{price:,}\n"
+                "**お支払い方法：PayPay**\n\n"
+                "下の専用入力フォームにPayPayリンクを入力してください。\n"
+                "送信されたリンクは指定アカウントのDMにのみ転送され、チケットにはリンク自体を表示しません。"
+            )
+            items.append(_button(
+                "PayPayリンクを入力・送信", "ord:p:paypay_open",
+                style=discord.ButtonStyle.primary, emoji="💳", row=0,
+            ))
+        items.append(_button("注文を取り消す", "ord:cancel:pay", emoji="✖️", row=1))
+
+    elif status == "link_sent":
+        title = "PayPayリンクを転送しました"
+        body = (
+            "PayPay受け取りリンクを検知し、指定の管理アカウントへDMで転送しました。\n"
+            "リンクはチケット上では伏せ字になっています。\n"
+            "お支払い完了後、スタッフの確認をお待ちください。"
+        )
+        color = COLOR_GLOW
 
     elif status == "submitted":
         title = "ご相談をスタッフへ送信しました"
@@ -1342,14 +1305,15 @@ def build_info_modal(state, ret):
         custom_id=f"ord:modal:info:{ret}",
         timeout=600,
     )
-    modal.add_item(discord.ui.TextInput(
-        label="プレイヤータグ（必須）",
-        custom_id="tag",
-        placeholder="#ABC123",
-        default=answers.get("tag") or None,
-        required=True,
-        max_length=16,
-    ))
+    if answers.get("service") == "trophy":
+        modal.add_item(discord.ui.TextInput(
+            label="プレイヤータグ（必須）",
+            custom_id="tag",
+            placeholder="#ABC123",
+            default=answers.get("tag") or None,
+            required=True,
+            max_length=16,
+        ))
     if answers.get("service") == "trophy":
         brawler = answers.get("brawler")
         modal.add_item(discord.ui.TextInput(
@@ -1389,6 +1353,22 @@ def build_detail_modal(state, ret):
         max_length=800,
     ))
     return modal
+
+
+class PayPayLinkModal(discord.ui.Modal):
+    def __init__(self, channel_id, message_id):
+        super().__init__(
+            title="PayPay受け取りリンクの入力",
+            custom_id=f"ord:p:paypay_submit:{channel_id}:{message_id}",
+            timeout=300,
+        )
+        self.add_item(discord.ui.TextInput(
+            label="PayPay受け取りリンク",
+            custom_id="paypay_url",
+            placeholder="https://pay.paypay.ne.jp/...",
+            required=True,
+            max_length=300,
+        ))
 
 
 def modal_values(data):
@@ -1465,6 +1445,11 @@ def build_staff_embed(state, ticket_channel, title, panel_url=None, handled_by=N
             value=box(f"¥ {price:,}" if price is not None else EMPTY),
             inline=False,
         )
+        embed.add_field(
+            name="お支払い方法",
+            value=box(PAYMENT_LABELS.get(state["answers"].get("payment"), EMPTY)),
+            inline=False,
+        )
     embed.set_footer(text=f"ORDER #{oid}（スタッフ控え）")
     return embed
 
@@ -1474,7 +1459,21 @@ def staff_view(state, channel_id, message_id):
     is_cheat = state["answers"].get("category") == "cheat"
     suffix = f"{channel_id}:{message_id}"
     items = []
-    if status in ("submitted", "reported"):
+    if status == "submitted" and not is_cheat:
+        if state["answers"].get("payment") == "paypay":
+            items.append(_button(
+                "お客様のPayPayリンク入力待ち",
+                f"ord:s:noop:{suffix}",
+                emoji="⏳", row=0, disabled=True,
+            ))
+        else:
+            items.append(_button(
+                "お客様のLTC送金報告待ち",
+                f"ord:s:noop:{suffix}",
+                emoji="⏳", row=0, disabled=True,
+            ))
+        items.append(_button("注文取消", f"ord:s:cancel:{suffix}", emoji="✖️", row=1))
+    elif status in ("link_sent", "reported") or (status == "submitted" and is_cheat):
         items.append(_button(
             "対応開始" if is_cheat else "入金確認・対応開始",
             f"ord:s:paid:{suffix}",
@@ -1583,7 +1582,7 @@ async def handle_customer_action(interaction, parts):
 
     if action == "set":            # ord:set:<key>:<value>:<ret>
         key, value, ret = parts[2], parts[3], parts[4]
-        allowed = {"category": CATEGORY_LABELS, "service": SERVICE_LABELS, "device": DEVICE_LABELS}
+        allowed = {"category": CATEGORY_LABELS, "service": SERVICE_LABELS, "device": DEVICE_LABELS, "payment": PAYMENT_LABELS}
         if key not in allowed or value not in allowed[key]:
             return await _ephemeral(interaction, "不正な選択です。")
         apply_answer(state, key, value)
@@ -1619,16 +1618,17 @@ async def handle_customer_action(interaction, parts):
         key, ret = parts[2], parts[3]
         values = modal_values(interaction.data)
         if key == "info":
-            tag = normalize_tag(values.get("tag"))
-            if tag is None:
-                return await _ephemeral(
-                    interaction,
-                    "プレイヤータグの形式が正しくありません。`#` と英数字（例：`#ABC123`）で入力してください。",
-                )
-            state["answers"]["tag"] = tag
             if state["answers"].get("service") == "trophy":
+                tag = normalize_tag(values.get("tag"))
+                if tag is None:
+                    return await _ephemeral(
+                        interaction,
+                        "プレイヤータグの形式が正しくありません。`#` と英数字（例：`#ABC123`）で入力してください。",
+                    )
+                state["answers"]["tag"] = tag
                 state["answers"]["brawler"] = clean_text(values.get("brawler"), 40) or "なし"
             else:
+                state["answers"].pop("tag", None)
                 state["answers"].pop("brawler", None)
             state["answers"]["note"] = clean_text(values.get("note"), 300) or "なし"
         else:
@@ -1661,23 +1661,75 @@ async def handle_customer_action(interaction, parts):
     if action == "submit":
         if first_incomplete(state) != "confirm":
             return await _ephemeral(interaction, "未入力の項目があります。")
-        state["status"] = "submitted"
-        await _show(interaction, state)
-        title = "🧩 新しいご相談" if state["answers"].get("category") == "cheat" else "🔔 新規注文"
-        await notify_staff(interaction.guild, channel, message, state, title)
+        is_cheat = state["answers"].get("category") == "cheat"
+        if is_cheat:
+            state["status"] = "submitted"
+            await _show(interaction, state)
+            await notify_staff(interaction.guild, channel, message, state, "🧩 新しいご相談")
+        else:
+            state["status"] = "payment_select"
+            intake_embed = build_order_embed(
+                state,
+                "注文内容を受け付けました",
+                "注文内容の入力が完了しました。\n下に表示された別の「お支払い専用メニュー」から、お支払い方法を選択してください。",
+                color=COLOR_GLOW,
+            )
+            await interaction.response.edit_message(embed=intake_embed, view=None)
+            payment_embed, payment_view = render_panel(state)
+            payment_message = await safe_send(
+                channel,
+                f"<@{owner_id}> お支払い専用メニューです。",
+                embed=payment_embed,
+                view=payment_view,
+            )
+            if payment_message is None:
+                await safe_send(channel, "⚠️ お支払い画面を作成できませんでした。スタッフにお知らせください。")
+                return
         logger.info("注文確定: #%s owner=%s", state["order_id"], owner_id)
         return
 
+    if action == "pay":
+        payment = parts[2] if len(parts) > 2 else None
+        if state["status"] != "payment_select" or payment not in PAYMENT_LABELS:
+            return await _ephemeral(interaction, "この画面では支払い方法を選択できません。")
+        state["answers"]["payment"] = payment
+        state["status"] = "submitted"
+        await _show(interaction, state)
+        if payment == "paypay":
+            await notify_staff(
+                interaction.guild, channel, message, state,
+                "💳 PayPayリンク入力待ち",
+            )
+            await safe_send(
+                channel,
+                f"<@{owner_id}> PayPayを選択しました。専用入力フォームからPayPayリンクを送信してください。",
+            )
+        else:
+            await safe_send(
+                channel,
+                f"<@{owner_id}> LTC送金先アドレスを表示しました。送金後、専用画面の「はい、送金しました」を押してください。",
+            )
+        return
+
+    if action == "copy":
+        if parts[2] == "ltc":
+            return await _ephemeral(interaction, f"LTCアドレス：\n`{LTC_ADDRESS}`")
+        return await _ephemeral(interaction, "コピー対象が不正です。")
+
     if action == "report":
-        if state["status"] != "submitted" or state["answers"].get("category") != "boost":
-            return await _ephemeral(interaction, "現在この操作はできません。")
+        if (
+            state["status"] != "submitted"
+            or state["answers"].get("category") != "boost"
+            or state["answers"].get("payment") != "ltc"
+        ):
+            return await _ephemeral(interaction, "LTCを選択した注文でのみ、この操作を利用できます。")
         state["status"] = "reported"
         await _show(interaction, state)
         await notify_staff(interaction.guild, channel, message, state, "💸 入金報告がありました")
         return
 
     if action == "cancel":         # ord:cancel:<戻り先>
-        if state["status"] not in ("draft", "submitted"):
+        if state["status"] not in ("draft", "payment_select", "submitted"):
             return await _ephemeral(
                 interaction,
                 "入金報告後のキャンセルはスタッフが対応します。このチャンネルでお知らせください。",
@@ -1694,7 +1746,7 @@ async def handle_customer_action(interaction, parts):
 
     if action == "cxy":            # キャンセル確定
         previous = state["status"]
-        if previous not in ("draft", "submitted"):
+        if previous not in ("draft", "payment_select", "submitted"):
             return await _ephemeral(interaction, "現在の状態ではキャンセルできません。")
         state["status"] = "cancelled"
         await _show(interaction, state)
@@ -1715,6 +1767,77 @@ async def handle_customer_action(interaction, parts):
     await _ephemeral(interaction, "不明な操作です。")
 
 
+async def handle_customer_paypay_action(interaction, parts):
+    """客専用PayPay入力フォーム。リンクはチケット投稿せず指定IDへDM転送する。"""
+    action = parts[2] if len(parts) > 2 else ""
+    if action == "paypay_open":
+        message = interaction.message
+        state = parse_order_message(message)
+        if (state is None or not is_ticket(interaction.channel)
+                or interaction.user.id != state.get("owner_id")
+                or state.get("status") != "submitted"
+                or state.get("answers", {}).get("payment") != "paypay"):
+            return await _ephemeral(interaction, "この注文ではPayPayリンクを入力できません。")
+        if _ticket_closed_for(interaction.channel, state["owner_id"]):
+            return await _ephemeral(interaction, "このチケットはクローズされています。")
+        await interaction.response.send_modal(PayPayLinkModal(interaction.channel.id, message.id))
+        return
+
+    if action == "paypay_submit":
+        try:
+            channel_id, message_id = int(parts[3]), int(parts[4])
+        except (IndexError, ValueError):
+            return await _ephemeral(interaction, "注文情報を読み込めませんでした。")
+        raw_link = clean_text(modal_values(interaction.data).get("paypay_url"), 300)
+        match = PAYPAY_URL_RE.fullmatch(raw_link)
+        if not match:
+            return await _ephemeral(interaction, "PayPayリンクの形式が正しくありません。pay.paypay.ne.jp のリンクを入力してください。")
+        link = match.group(0)
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            channel = await bot.fetch_channel(channel_id)
+        if not is_ticket(channel):
+            return await _ephemeral(interaction, "チケットを確認できませんでした。")
+        try:
+            panel = await channel.fetch_message(message_id)
+        except discord.NotFound:
+            return await _ephemeral(interaction, "お支払い画面が見つかりません。")
+        state = parse_order_message(panel)
+        if (state is None or interaction.user.id != state.get("owner_id")
+                or state.get("status") != "submitted"
+                or state.get("answers", {}).get("payment") != "paypay"):
+            return await _ephemeral(interaction, "この注文ではPayPayリンクを受け付けられません。")
+        if _ticket_closed_for(channel, state["owner_id"]):
+            return await _ephemeral(interaction, "このチケットはクローズされています。")
+        await interaction.response.defer(ephemeral=True)
+        try:
+            recipient = bot.get_user(PAYPAY_FORWARD_USER_ID)
+            if recipient is None:
+                recipient = await bot.fetch_user(PAYPAY_FORWARD_USER_ID)
+            await recipient.send(
+                "PayPay受け取りリンクです。\n"
+                f"チケット：{channel.mention}\n"
+                f"注文ID：#{state['order_id']}\n"
+                f"送信者ID：{interaction.user.id}\n"
+                f"{link}"
+            )
+        except discord.HTTPException as error:
+            log_http_error("PayPayリンクのDM送信", error)
+            return await _ephemeral(interaction, "DM送信に失敗しました。リンクは転送されていません。送信先のDM設定を確認してください。")
+
+        state["status"] = "link_sent"
+        embed, view = render_panel(state)
+        try:
+            await panel.edit(embed=embed, view=view)
+            await notify_staff(interaction.guild, channel, panel, state, "💳 お客様のPayPayリンク入力・DM転送完了")
+            await safe_send(channel, f"💳 <@{state['owner_id']}> PayPayリンクを受け付けました。指定アカウントへDM転送済みです。リンク自体はチケットに表示していません。")
+        except discord.HTTPException as error:
+            log_http_error("PayPay転送後の画面更新・スタッフ通知", error)
+        return await _ephemeral(interaction, "PayPayリンクを指定アカウントのDMへ送信しました。チケットにはリンクを表示していません。")
+
+    return await _ephemeral(interaction, "不明な操作です。")
+
+
 async def handle_staff_action(interaction, parts):
     # ord:s:<action>:<channel_id>:<message_id>
     if not is_staff(interaction.user):
@@ -1729,9 +1852,9 @@ async def handle_staff_action(interaction, parts):
         return
 
     transitions = {
-        "paid": ({"submitted", "reported"}, "paid"),
+        "paid": ({"submitted", "link_sent", "reported"}, "paid"),
         "done": ({"paid"}, "done"),
-        "cancel": ({"draft", "submitted", "reported", "paid"}, "cancelled"),
+        "cancel": ({"draft", "payment_select", "submitted", "link_sent", "reported", "paid"}, "cancelled"),
     }
     if action not in transitions:
         await _ephemeral(interaction, "不明な操作です。")
@@ -1755,6 +1878,13 @@ async def handle_staff_action(interaction, parts):
             return
 
         allowed, new_status = transitions[action]
+        if (
+            action == "paid"
+            and state["status"] == "submitted"
+            and state["answers"].get("category") == "boost"
+        ):
+            await _ephemeral(interaction, "お客様のお支払い手続きが完了するまで、対応開始はできません。")
+            return
         if state["status"] not in allowed:
             await _ephemeral(
                 interaction,
@@ -1803,6 +1933,9 @@ async def on_order_interaction(interaction):
 
     parts = custom_id.split(":")
     try:
+        if len(parts) > 1 and parts[1] == "p":
+            await handle_customer_paypay_action(interaction, parts)
+            return
         if parts[1] == "s":
             await handle_staff_action(interaction, parts)
             return
@@ -1820,7 +1953,7 @@ async def on_order_interaction(interaction):
 
 
 # ==========================================
-# 15. チケットパネル
+# 14. チケットパネル
 # ==========================================
 
 class TicketPanel(discord.ui.View):
@@ -1924,7 +2057,7 @@ class TicketPanel(discord.ui.View):
 
 
 # ==========================================
-# 16. チケット操作
+# 15. チケット操作
 # ==========================================
 
 class OpenTicketView(discord.ui.View):
@@ -2015,7 +2148,7 @@ class ClosedTicketView(discord.ui.View):
 
 
 # ==========================================
-# 17. 起動・接続イベント
+# 16. 起動・接続イベント
 # ==========================================
 
 @bot.event
@@ -2027,15 +2160,13 @@ async def on_connect():
 async def on_ready():
     logger.info("================================")
     logger.info("Bot起動成功: %s", bot.user)
-    logger.info("AI: %s", "有効" if ai_enabled else "無効")
-    logger.info("Geminiモデル: %s", AI_MODEL)
     logger.info("スタッフ通知先: %s", STAFF_CHANNEL_ID or "各チケット内")
     logger.info("PayPayリンク: %s", "設定済み" if (PAYPAY_LINK or PAYPAY_LINKS) else "未設定")
     logger.info("================================")
 
 
 # ==========================================
-# 18. スタッフ用コマンド
+# 17. スタッフ用コマンド
 # ==========================================
 
 @bot.command()
@@ -2074,153 +2205,20 @@ async def order_panel(ctx):
     await send_order_panel(ctx.channel, owner_id)
 
 
-@bot.command()
-async def ai_on(ctx):
-    global ai_enabled
-    if not is_staff(ctx.author):
-        return
-    ai_enabled = True
-    await ctx.send("AIを有効にしました。")
-
-
-@bot.command()
-async def ai_off(ctx):
-    global ai_enabled
-    if not is_staff(ctx.author):
-        return
-    ai_enabled = False
-    await ctx.send("AIを無効にしました。")
-
-
-@bot.command()
-async def ai_resume(ctx):
-    if not is_staff(ctx.author):
-        return
-
-    paused_channels.discard(ctx.channel.id)
-    handoff_notified.discard(ctx.channel.id)
-    histories.pop(ctx.channel.id, None)
-
-    await ctx.send("このチャンネルのAIを再開しました。")
-
-
 # ==========================================
 # 19. メッセージ処理
 # ==========================================
 
+
+
 @bot.event
 async def on_message(message):
-    if message.author.bot:
-        return
-
+    # PayPayリンクは専用モーダルで受け付ける（通常メッセージでは受け付けない）。
     await bot.process_commands(message)
-
-    if message.content.startswith("!"):
-        return
-
-    channel = message.channel
-    ticket = is_ticket(channel)
-
-    if ticket and is_staff(message.author):
-        paused_channels.add(channel.id)
-        return
-
-    if not ai_enabled:
-        return
-
-    if channel.id in paused_channels:
-        return
-
-    if message.guild is None:
-        return
-
-    # チケット受付はボタン式に移行したため、チケット内でもAIが勝手に
-    # 受付を始めることはない。どのチャンネルでも、Botへのメンションか
-    # Botへの返信があったときだけAIが回答する。
-    mentioned = bot.user is not None and bot.user in message.mentions
-    replied = False
-
-    if message.reference:
-        referenced = message.reference.resolved
-        if (
-            isinstance(referenced, discord.Message)
-            and bot.user is not None
-            and referenced.author.id == bot.user.id
-        ):
-            replied = True
-
-    if not mentioned and not replied:
-        return
-
-    # 料金の自動判定
-    try:
-        rank_price = calculate_rank_price(message.content)
-        if rank_price is not None:
-            await safe_send(
-                channel,
-                f"料金表に基づく見積もりは **{rank_price:,}円** です。\n"
-                "ご依頼内容に間違いがないか確認してください。",
-            )
-            return
-
-        trophy_price = calculate_trophy_price(message.content)
-        if trophy_price is not None:
-            await safe_send(
-                channel,
-                f"料金表に基づく見積もりは **{trophy_price:,}円** です。\n"
-                "ご依頼内容に間違いがないか確認してください。",
-            )
-            return
-
-    except Exception as error:
-        log_unexpected_error("料金判定", error)
-
-    # Gemini AIに問い合わせ
-    async with channel_locks[channel.id]:
-        if channel.id in paused_channels:
-            return
-
-        try:
-            async with channel.typing():
-                answer = await ask_ai(channel.id, message.content)
-
-        except Exception as error:
-            log_unexpected_error("Gemini AI処理", error)
-
-            await safe_send(
-                channel,
-                "申し訳ありません。AIの応答でエラーが発生しました。\n"
-                "スタッフに確認を依頼してください。",
-            )
-
-            if channel.id not in handoff_notified:
-                mentions = staff_mentions(message.guild)
-                await safe_send(
-                    channel,
-                    f"⚠️ **スタッフの対応をお願いします。**\n{mentions}",
-                )
-                handoff_notified.add(channel.id)
-            return
-
-        # スタッフへの引き継ぎ
-        if "[STAFF_HANDOFF]" in answer:
-            answer = answer.replace("[STAFF_HANDOFF]", "").strip()
-            await send_long_message(channel, answer)
-
-            if channel.id not in handoff_notified:
-                mentions = staff_mentions(message.guild)
-                await safe_send(
-                    channel,
-                    f"⚠️ **スタッフへの確認が必要です。**\n{mentions}",
-                )
-                handoff_notified.add(channel.id)
-            return
-
-        await send_long_message(channel, answer)
 
 
 # ==========================================
-# 20. Discordイベントエラー
+# 18. Discordイベントエラー
 # ==========================================
 
 @bot.event
@@ -2229,13 +2227,12 @@ async def on_error(event_method, *args, **kwargs):
 
 
 # ==========================================
-# 21. Bot起動
+# 19. Bot起動
 # ==========================================
 
 logger.info("Botを起動します...")
 logger.info("Python version: %s", sys.version.split()[0])
 logger.info("discord.py version: %s", discord.__version__)
-logger.info("Gemini model setting: %s", AI_MODEL)
 
 try:
     bot.run(DISCORD_TOKEN, log_handler=None)
