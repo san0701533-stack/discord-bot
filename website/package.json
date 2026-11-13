@@ -1,0 +1,20 @@
+{
+  "name": "rsgy-website",
+  "version": "0.1.0",
+  "private": true,
+  "description": "RSGY promotional website (Three.js / GSAP)",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@fontsource/inter": "5.1.0",
+    "@fontsource/syncopate": "5.1.0",
+    "gsap": "3.12.5",
+    "three": "0.170.0"
+  }
+}
