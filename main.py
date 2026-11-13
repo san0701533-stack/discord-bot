@@ -256,19 +256,28 @@ RANK_ALIASES = {
     7: ["プロ", "pro"],
 }
 
+# 料金表に直接記載された区間（rank_quote ではこちらを最優先で使う）
 RANK_PRICES = {
-    (0, 1): 900,
-    (1, 4): 4200,
-    (2, 4): 3200,
-    (3, 4): 2000,
-    (4, 5): 8000,
-    (5, 6): 20000,
-    (6, 7): 40000,
+    (0, 1): 900,      # エリート1〜レジェンド1
+    (1, 2): 1000,     # レジェンド1〜レジェンド2
+    (2, 3): 1200,     # レジェンド2〜レジェンド3
+    (1, 4): 4200,     # レジェンド1〜マスター1
+    (2, 4): 3200,     # レジェンド2〜マスター1
+    (3, 4): 2000,     # レジェンド3〜マスター1
+    (4, 5): 8000,     # マスター1〜マスター2
+    (5, 6): 20000,    # マスター2〜マスター3
+    (6, 7): 40000,    # マスター3〜プロ
 }
 
+# 連結して自動計算してよい区間（エリート〜レジェンド帯〜マスター1）。
+# 例：レジェンド1〜レジェンド3 = 1,000 + 1,200 = 2,200円。
+# マスター帯（マスター1以降）は連結しない。
 RANK_SEGMENTS = {
     (0, 1): 900,
     (1, 4): 4200,
+    (1, 2): 1000,
+    (2, 3): 1200,
+    (3, 4): 2000,
 }
 
 TROPHY_PRICES = {
@@ -359,20 +368,8 @@ def calculate_rank_price(text):
     if start >= goal:
         return None
 
-    direct = RANK_PRICES.get((start, goal))
-    if direct is not None:
-        return direct
-
-    if len(ranks) >= 3:
-        total = 0
-        for i in range(len(ranks) - 1):
-            price = RANK_SEGMENTS.get((ranks[i], ranks[i + 1]))
-            if price is None:
-                return None
-            total += price
-        return total
-
-    return None
+    # ボタン式受付と同じ計算（直接区間を優先し、レジェンド帯は連結して合計）
+    return rank_quote(start, goal)
 
 
 def calculate_trophy_price(text):
