@@ -488,7 +488,13 @@ CATEGORY_LABELS = {"boost": "代行", "cheat": "チート"}
 SERVICE_LABELS = {"trophy": "トロ上げ代行", "ranked": "ガチバ代行"}
 PAYMENT_LABELS = {"paypay": "PayPay", "ltc": "LTC（仮想通貨）"}
 LTC_ADDRESS = "LbuHqe7Uy5NgqGYi2AT544aY41CcYiSMcs"
-PAYPAY_FORWARD_USER_ID = 1462791798891090084
+# PayPay受け取りリンクのDM送信先（区分ごと）
+PAYPAY_BOOST_USER_ID = 1318679308688036023   # 「代行」のリンク受け取り先
+PAYPAY_CHEAT_USER_ID = 1462791798891090084   # 「チート」のリンク受け取り先
+# 「代行」のリンクを PAYPAY_BOOST_USER_ID へ送ったことを知らせる相手（金額などを通知）
+PAYPAY_NOTIFY_USER_ID = 1462791798891090084
+PAYPAY_RECIPIENT_IDS = {PAYPAY_BOOST_USER_ID, PAYPAY_CHEAT_USER_ID}
+PAYPAY_AMOUNT_MAX = 10_000_000
 PAYPAY_URL_RE = re.compile(r"https?://pay\.paypay\.ne\.jp/[A-Za-z0-9_-]+", re.IGNORECASE)
 DEVICE_LABELS = {"ios": "iOS", "android": "Android"}
 
@@ -513,6 +519,22 @@ STATUS_FROM_TEXT.setdefault("PayPayリンク転送済み", "link_sent")
 # (パネルのメッセージID, 注文ID) の組で記録する。
 paypay_dm_sent_panels = set()
 paypay_confirmed_panels = set()
+
+
+def paypay_recipient_id(state):
+    """区分に応じたPayPayリンクのDM送信先。"""
+    if state["answers"].get("category") == "cheat":
+        return PAYPAY_CHEAT_USER_ID
+    return PAYPAY_BOOST_USER_ID
+
+
+def parse_yen_amount(text):
+    """「3,000円」「¥3000」などの入力から金額（整数）を取り出す。不正なら None。"""
+    cleaned = re.sub(r"[\s,，、¥￥円]", "", unicodedata.normalize("NFKC", text or ""))
+    if not cleaned.isdigit():
+        return None
+    amount = int(cleaned)
+    return amount if 1 <= amount <= PAYPAY_AMOUNT_MAX else None
 
 
 def mask_paypay_link(_link=None):
@@ -702,7 +724,7 @@ def summary_keys(state):
     answers = state["answers"]
     category = answers.get("category")
     if category == "cheat":
-        return ["category", "device", "detail"]
+        return ["category", "device", "detail", "payment"]
     if category == "boost":
         keys = ["category", "service"]
         service = answers.get("service")
@@ -819,7 +841,7 @@ def _progress_header(state, step):
 def _status_header(state):
     is_cheat = state["answers"].get("category") == "cheat"
     stages = (
-        ["受付", "スタッフ確認", "対応中", "完了"]
+        ["受付", "入金確認", "対応中", "完了"]
         if is_cheat
         else ["注文受付", "入金確認", "対応中", "完了"]
     )
@@ -1125,7 +1147,8 @@ def render_confirm(state):
         title = "ご相談内容の最終確認"
         body = (
             "以下の内容でよろしければ **スタッフへ送信** を押してください。\n"
-            "送信後、担当スタッフから個別にご連絡します。"
+            "送信後、担当スタッフが料金を個別にご案内します。\n"
+            "あわせて、お支払い専用の画面を別に表示します。"
         )
         submit_label = "スタッフへ送信"
     else:
@@ -1181,11 +1204,23 @@ def render_status(state):
     items = []
     color = COLOR_MAIN
 
-    if status == "payment_select" and not is_cheat:
-        price = order_quote(state)
+    # チートは料金を個別案内するため、金額はスタッフの案内に従ってもらう
+    if is_cheat:
+        price_heading = (
+            "### お支払い金額　スタッフがご案内した金額\n"
+            "※ 料金はスタッフがこのチケットで個別にご案内します。金額の案内を受けてからお支払いください。\n"
+        )
+    elif status in ("payment_select", "submitted"):
+        price_heading = f"### お支払い金額　¥{order_quote(state):,}\n"
+    else:
+        price_heading = ""
+    # 旧フロー（支払い方法なし）で送信済みのチート相談は、従来の画面のまま扱う
+    has_payment_flow = not is_cheat or bool(state["answers"].get("payment"))
+
+    if status == "payment_select":
         title = "お支払い専用メニュー"
         body = (
-            f"### お支払い金額　¥{price:,}\n"
+            f"{price_heading}"
             "この画面はお支払い専用です。ご希望の方法を選択してください。\n\n"
             "💳 **PayPay**　選択すると受け取りリンクの入力画面が開きます。リンクはチケットに表示されません。\n"
             "🪙 **LTC（仮想通貨）**　送金先アドレスを表示します。送金後はお客様ご自身で報告してください。"
@@ -1196,13 +1231,12 @@ def render_status(state):
             _button("注文を取り消す", "ord:cancel:payment", emoji="✖️", row=1),
         ])
 
-    elif status == "submitted" and not is_cheat:
-        price = order_quote(state)
+    elif status == "submitted" and has_payment_flow:
         payment = state["answers"].get("payment")
         title = "お見積り・お支払いのご案内"
         if payment == "ltc":
             body = (
-                f"### お支払い金額　¥{price:,}\n"
+                f"{price_heading}"
                 "**お支払い方法：LTC（仮想通貨）**\n\n"
                 "下記のアドレスにLTCで送金してください。\n"
                 f"```\n{LTC_ADDRESS}\n```\n"
@@ -1217,7 +1251,7 @@ def render_status(state):
             ))
         else:
             body = (
-                f"### お支払い金額　¥{price:,}\n"
+                f"{price_heading}"
                 "**お支払い方法：PayPay**\n\n"
                 "下の「PayPayリンクを入力・送信」ボタンから、PayPay受け取りリンクを入力してください。\n"
                 "送信されたリンクは指定アカウントのDMにのみ転送され、チケットにはリンク自体を表示しません。\n\n"
@@ -1267,6 +1301,9 @@ def render_status(state):
         title = "対応を開始しました"
         body = (
             "スタッフが内容を確認し、対応を開始しました。\n"
+            "進行状況はこのチャンネルでご連絡します。"
+            if is_cheat and not has_payment_flow else
+            "入金を確認しました。担当スタッフが対応を開始します。\n"
             "進行状況はこのチャンネルでご連絡します。"
             if is_cheat else
             "入金を確認しました。担当スタッフが代行を開始します。\n"
@@ -1382,7 +1419,7 @@ def build_detail_modal(state, ret):
 
 
 class PayPayLinkModal(discord.ui.Modal):
-    def __init__(self, channel_id, message_id):
+    def __init__(self, channel_id, message_id, *, ask_amount=False):
         super().__init__(
             title="PayPay受け取りリンクの入力",
             custom_id=f"ord:p:paypay_submit:{channel_id}:{message_id}",
@@ -1395,6 +1432,15 @@ class PayPayLinkModal(discord.ui.Modal):
             required=True,
             max_length=300,
         ))
+        if ask_amount:
+            # チートは料金が個別案内のため、送金額をお客様に入力してもらう
+            self.add_item(discord.ui.TextInput(
+                label="送金額（円）",
+                custom_id="paypay_amount",
+                placeholder="例：3000（スタッフからご案内した金額）",
+                required=True,
+                max_length=12,
+            ))
 
 
 def modal_values(data):
@@ -1484,8 +1530,16 @@ def staff_view(state, channel_id, message_id):
     status = state["status"]
     is_cheat = state["answers"].get("category") == "cheat"
     suffix = f"{channel_id}:{message_id}"
+    has_payment_flow = not is_cheat or bool(state["answers"].get("payment"))
     items = []
-    if status == "submitted" and not is_cheat:
+    if status == "payment_select":
+        items.append(_button(
+            "お客様のお支払い方法選択待ち",
+            f"ord:s:noop:{suffix}",
+            emoji="⏳", row=0, disabled=True,
+        ))
+        items.append(_button("注文取消", f"ord:s:cancel:{suffix}", emoji="✖️", row=1))
+    elif status == "submitted" and has_payment_flow:
         if state["answers"].get("payment") == "paypay":
             items.append(_button(
                 "お客様のPayPayリンク入力待ち",
@@ -1507,9 +1561,9 @@ def staff_view(state, channel_id, message_id):
             emoji="⏳", row=0, disabled=True,
         ))
         items.append(_button("注文取消", f"ord:s:cancel:{suffix}", emoji="✖️", row=1))
-    elif status in ("received", "reported") or (status == "submitted" and is_cheat):
+    elif status in ("received", "reported") or status == "submitted":
         items.append(_button(
-            "対応開始" if is_cheat else "入金確認・対応開始",
+            "対応開始" if not has_payment_flow else "入金確認・対応開始",
             f"ord:s:paid:{suffix}",
             style=discord.ButtonStyle.primary, emoji="✅", row=0,
         ))
@@ -1702,29 +1756,33 @@ async def handle_customer_action(interaction, parts):
         if first_incomplete(state) != "confirm":
             return await _ephemeral(interaction, "未入力の項目があります。")
         is_cheat = state["answers"].get("category") == "cheat"
+        # 代行・チート共通：注文内容を確定し、支払い方法は別メッセージの専用UIで選択する
+        state["status"] = "payment_select"
+        intake_embed = build_order_embed(
+            state,
+            "ご相談内容を受け付けました" if is_cheat else "注文内容を受け付けました",
+            (
+                "ご相談内容をスタッフへ送信しました。料金はスタッフがこのチャンネルで個別にご案内します。\n"
+                "金額の案内後、下に表示された別の「お支払い専用メニュー」から、お支払い方法を選択してください。"
+                if is_cheat else
+                "注文内容の入力が完了しました。\n下に表示された別の「お支払い専用メニュー」から、お支払い方法を選択してください。"
+            ),
+            color=COLOR_GLOW,
+        )
+        await interaction.response.edit_message(embed=intake_embed, view=None)
+        payment_embed, payment_view = render_panel(state)
+        payment_message = await safe_send(
+            channel,
+            f"<@{owner_id}> お支払い専用メニューです。",
+            embed=payment_embed,
+            view=payment_view,
+        )
+        if payment_message is None:
+            await safe_send(channel, "⚠️ お支払い画面を作成できませんでした。スタッフにお知らせください。")
+            return
         if is_cheat:
-            state["status"] = "submitted"
-            await _show(interaction, state)
-            await notify_staff(interaction.guild, channel, message, state, "🧩 新しいご相談")
-        else:
-            state["status"] = "payment_select"
-            intake_embed = build_order_embed(
-                state,
-                "注文内容を受け付けました",
-                "注文内容の入力が完了しました。\n下に表示された別の「お支払い専用メニュー」から、お支払い方法を選択してください。",
-                color=COLOR_GLOW,
-            )
-            await interaction.response.edit_message(embed=intake_embed, view=None)
-            payment_embed, payment_view = render_panel(state)
-            payment_message = await safe_send(
-                channel,
-                f"<@{owner_id}> お支払い専用メニューです。",
-                embed=payment_embed,
-                view=payment_view,
-            )
-            if payment_message is None:
-                await safe_send(channel, "⚠️ お支払い画面を作成できませんでした。スタッフにお知らせください。")
-                return
+            # チートは料金が個別案内のため、相談内容はこの時点でスタッフへ通知する
+            await notify_staff(interaction.guild, channel, payment_message, state, "🧩 新しいご相談")
         logger.info("注文確定: #%s owner=%s", state["order_id"], owner_id)
         return
 
@@ -1735,7 +1793,10 @@ async def handle_customer_action(interaction, parts):
         if payment == "paypay":
             # PayPay選択だけでは処理を完了させず、すぐに受け取りリンクの入力画面を開く。
             # 状態の更新・スタッフ通知はリンク送信後の段階で行う（ここでは通知しない）。
-            await interaction.response.send_modal(PayPayLinkModal(channel.id, message.id))
+            await interaction.response.send_modal(PayPayLinkModal(
+                channel.id, message.id,
+                ask_amount=state["answers"].get("category") == "cheat",
+            ))
             return
         state["answers"]["payment"] = payment
         state["status"] = "submitted"
@@ -1755,7 +1816,6 @@ async def handle_customer_action(interaction, parts):
     if action == "report":
         if (
             state["status"] != "submitted"
-            or state["answers"].get("category") != "boost"
             or state["answers"].get("payment") != "ltc"
         ):
             return await _ephemeral(interaction, "LTCを選択した注文でのみ、この操作を利用できます。")
@@ -1786,8 +1846,13 @@ async def handle_customer_action(interaction, parts):
             return await _ephemeral(interaction, "現在の状態ではキャンセルできません。")
         state["status"] = "cancelled"
         await _show(interaction, state)
-        # PayPayのリンク入力待ち段階はスタッフへ未通知のため、取消通知も送らない
-        if previous == "submitted" and state["answers"].get("payment") != "paypay":
+        # 代行のPayPayリンク入力待ち段階はスタッフへ未通知のため、取消通知も送らない。
+        # チートは相談送信時点でスタッフへ通知済みのため、支払い前の取消も知らせる。
+        if state["answers"].get("category") == "cheat":
+            staff_knows = previous in ("payment_select", "submitted")
+        else:
+            staff_knows = previous == "submitted" and state["answers"].get("payment") != "paypay"
+        if staff_knows:
             await notify_staff(interaction.guild, channel, message, state, "✖️ お客様が注文を取り消しました")
         return
 
@@ -1837,7 +1902,7 @@ async def _fetch_ticket_panel(channel_id, message_id):
 
 def _paypay_link_input_allowed(state):
     """PayPayリンクを受け付けてよい状態か（支払い方法選択中 or PayPayリンク入力待ち）。"""
-    if state is None or state["answers"].get("category") != "boost":
+    if state is None or state["answers"].get("category") not in CATEGORY_LABELS:
         return False
     if state["status"] == "payment_select":
         return True
@@ -1866,7 +1931,10 @@ async def handle_customer_paypay_action(interaction, parts):
             return await _ephemeral(interaction, "この注文ではPayPayリンクを入力できません。")
         if _ticket_closed_for(interaction.channel, state["owner_id"]):
             return await _ephemeral(interaction, "このチケットはクローズされています。")
-        await interaction.response.send_modal(PayPayLinkModal(interaction.channel.id, message.id))
+        await interaction.response.send_modal(PayPayLinkModal(
+            interaction.channel.id, message.id,
+            ask_amount=state["answers"].get("category") == "cheat",
+        ))
         return
 
     # ---- リンク送信（モーダル送信） ----
@@ -1876,7 +1944,8 @@ async def handle_customer_paypay_action(interaction, parts):
         except (IndexError, ValueError):
             return await _ephemeral(interaction, "注文情報を読み込めませんでした。")
 
-        raw_link = clean_text(modal_values(interaction.data).get("paypay_url"), 300)
+        submitted_values = modal_values(interaction.data)
+        raw_link = clean_text(submitted_values.get("paypay_url"), 300)
         match = PAYPAY_URL_RE.search(raw_link)
         if not match:
             return await _ephemeral(
@@ -1904,6 +1973,20 @@ async def handle_customer_paypay_action(interaction, parts):
             if not _paypay_link_input_allowed(state):
                 return await _ephemeral(interaction, "この注文ではPayPayリンクを受け付けられません。")
 
+            # 金額：代行は見積りから自動計算、チートはお客様がフォームに入力した送金額
+            is_cheat = state["answers"].get("category") == "cheat"
+            if is_cheat:
+                price = parse_yen_amount(submitted_values.get("paypay_amount"))
+                if price is None:
+                    return await _ephemeral(
+                        interaction,
+                        "送金額の形式が正しくありません。スタッフからご案内した金額を数字で入力してください（例：`3000`）。",
+                    )
+            else:
+                price = order_quote(state)
+            recipient_id = paypay_recipient_id(state)
+            category_label = CATEGORY_LABELS.get(state["answers"].get("category"), EMPTY)
+
             # 段階1：PayPay選択を確定し「リンク入力待ち」にする（DM失敗時はこの画面に留まる）
             if state["status"] == "payment_select":
                 state["answers"]["payment"] = "paypay"
@@ -1916,14 +1999,14 @@ async def handle_customer_paypay_action(interaction, parts):
                     return await _ephemeral(interaction, "お支払い画面を更新できませんでした。もう一度お試しください。")
 
             # 段階2：指定ユーザーへDM送信（メンション付き・確認ボタン付き）
-            price = order_quote(state)
             dm_text = (
-                f"<@{PAYPAY_FORWARD_USER_ID}>\n"
+                f"<@{recipient_id}>\n"
                 "💳 **PayPay受け取りリンクが届きました**\n"
                 f"注文ID：#{state['order_id']}\n"
+                f"区分：{category_label}\n"
             )
             if price is not None:
-                dm_text += f"金額：¥{price:,}\n"
+                dm_text += f"金額：¥{price:,}" + ("（お客様の申告額）\n" if is_cheat else "\n")
             dm_text += (
                 f"チケット：{channel.mention}（{channel.name}）\n"
                 f"お客様：<@{state['owner_id']}>（ID: {state['owner_id']}）\n"
@@ -1932,9 +2015,9 @@ async def handle_customer_paypay_action(interaction, parts):
                 "受け取りが完了したら、下の「受け取りました」ボタンを押してください。"
             )
             try:
-                recipient = bot.get_user(PAYPAY_FORWARD_USER_ID)
+                recipient = bot.get_user(recipient_id)
                 if recipient is None:
-                    recipient = await bot.fetch_user(PAYPAY_FORWARD_USER_ID)
+                    recipient = await bot.fetch_user(recipient_id)
                 await recipient.send(
                     dm_text,
                     view=_paypay_dm_view(channel.id, panel.id, order_id=state["order_id"]),
@@ -1950,7 +2033,31 @@ async def handle_customer_paypay_action(interaction, parts):
                 )
 
             paypay_dm_sent_panels.add((message_id, state["order_id"]))
-            logger.info("PayPayリンクDM送信: #%s", state["order_id"])
+            logger.info("PayPayリンクDM送信: #%s → %s", state["order_id"], recipient_id)
+
+            # 代行のリンクを受け取り先へ送ったことを、通知先ユーザーへDMで知らせる
+            # （リンク自体は含めない。失敗しても注文の進行は止めない）
+            if recipient_id == PAYPAY_BOOST_USER_ID and PAYPAY_NOTIFY_USER_ID != recipient_id:
+                service_label = SERVICE_LABELS.get(state["answers"].get("service"), EMPTY)
+                notify_text = (
+                    f"<@{PAYPAY_NOTIFY_USER_ID}>\n"
+                    f"📨 **<@{recipient_id}> にPayPayリンクを送信しました**\n"
+                    f"金額：{f'¥{price:,}' if price is not None else '不明'}\n"
+                    f"注文ID：#{state['order_id']}\n"
+                    f"区分：{category_label}（{service_label}）\n"
+                    f"チケット：{channel.mention}（{channel.name}）\n"
+                    f"お客様：<@{state['owner_id']}>（ID: {state['owner_id']}）"
+                )
+                try:
+                    notify_user = bot.get_user(PAYPAY_NOTIFY_USER_ID)
+                    if notify_user is None:
+                        notify_user = await bot.fetch_user(PAYPAY_NOTIFY_USER_ID)
+                    await notify_user.send(
+                        notify_text,
+                        allowed_mentions=discord.AllowedMentions(users=True),
+                    )
+                except discord.HTTPException as error:
+                    log_http_error("PayPayリンク送信の通知DM", error)
 
             # DM送信成功 → 受け取り確認待ち（スタッフへのメンションはしない）
             state["status"] = "link_sent"
@@ -1975,7 +2082,8 @@ async def handle_customer_paypay_action(interaction, parts):
     # ---- DM：「受け取りました」ボタン ----
     if action == "paypay_recv":
         # DMを受け取った本人だけが押せる
-        if interaction.user.id != PAYPAY_FORWARD_USER_ID:
+        # （送信先変更前に送ったDMのボタンも押せるよう、受け取り先のいずれかであればよい）
+        if interaction.user.id not in PAYPAY_RECIPIENT_IDS:
             return await _ephemeral(interaction, "このボタンはPayPayリンクの受け取り先ご本人のみ操作できます。")
         try:
             channel_id, message_id = int(parts[3]), int(parts[4])
@@ -2093,7 +2201,10 @@ async def handle_staff_action(interaction, parts):
         if (
             action == "paid"
             and state["status"] == "submitted"
-            and state["answers"].get("category") == "boost"
+            and (
+                state["answers"].get("category") == "boost"
+                or state["answers"].get("payment")
+            )
         ):
             await _ephemeral(interaction, "お客様のお支払い手続きが完了するまで、対応開始はできません。")
             return
@@ -2115,6 +2226,8 @@ async def handle_staff_action(interaction, parts):
             notices = {
                 "paid": (
                     f"{owner} スタッフが対応を開始しました。"
+                    if is_cheat and not state["answers"].get("payment") else
+                    f"{owner} 入金を確認しました。対応を開始します！"
                     if is_cheat else
                     f"{owner} 入金を確認しました。代行を開始します！"
                 ),
