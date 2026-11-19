@@ -15,6 +15,8 @@ from discord.ext import commands
 from flask import Flask
 from waitress import serve
 
+from anti_nuke import setup_anti_nuke
+
 
 # ==========================================
 # 1. ログ設定・エラー診断
@@ -195,6 +197,14 @@ def _parse_paypay_links():
 STAFF_CHANNEL_ID = _parse_int_env("STAFF_CHANNEL_ID")
 PAYPAY_LINKS = _parse_paypay_links()
 
+# ---- Nuke対策 ----
+# NUKE_BACKUP_USER_ID     : バックアップと検知通知を送る相手（DM）
+# NUKE_WHITELIST_BOT_IDS  : 検知の対象外にするBotのID（カンマ区切り・任意）
+NUKE_BACKUP_USER_ID = _parse_int_env("NUKE_BACKUP_USER_ID") or 1462791798891090084
+NUKE_WHITELIST_BOT_IDS = {
+    int(x) for x in os.getenv("NUKE_WHITELIST_BOT_IDS", "").replace(" ", "").split(",") if x.isdigit()
+}
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -212,6 +222,20 @@ class SupportBot(commands.Bot):
         # 注文受付のボタン・セレクト・モーダルは on_interaction で custom_id から
         # 直接処理するため、再起動後も追加登録なしで動作する。
         logger.info("永続Viewの登録が完了しました。")
+
+        # Nuke対策（/nuke対策）。バックアップと通知は NUKE_BACKUP_USER_ID のDMに送る。
+        # チケットは開閉で頻繁に増減するため、保存・復元の対象から外す。
+        setup_anti_nuke(
+            self,
+            backup_user_id=NUKE_BACKUP_USER_ID,
+            exclude_channel=is_ticket,
+            whitelist_bot_ids=NUKE_WHITELIST_BOT_IDS,
+        )
+        try:
+            synced = await self.tree.sync()
+            logger.info("スラッシュコマンドを同期しました: %s件", len(synced))
+        except discord.HTTPException as error:
+            log_http_error("スラッシュコマンドの同期", error)
 
 
 bot = SupportBot(
