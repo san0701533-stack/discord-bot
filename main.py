@@ -197,6 +197,14 @@ def _parse_paypay_links():
 STAFF_CHANNEL_ID = _parse_int_env("STAFF_CHANNEL_ID")
 PAYPAY_LINKS = _parse_paypay_links()
 
+# ---- 無言チケット・注文なしクローズの罰 ----
+NO_ORDER_ROLE_ID = 1575153786266325062        # 付けるロール
+NO_ORDER_NOTICE_CHANNEL_ID = 1575153532619726908  # 警告を送るチャンネル
+NO_ORDER_NOTICE_INTERVAL = 10                 # 警告メッセージの送信間隔（秒）
+SILENT_TICKET_HOURS = 24                      # この時間注文がなければ無言チケット
+SILENT_CHECK_INTERVAL = 600                   # 無言チケットを確認する間隔（秒）
+SILENT_TOPIC_FLAG = ":silent"                 # 無言で自動クローズ済みの印（チャンネルトピック）
+
 # ---- Nuke対策 ----
 # NUKE_BACKUP_USER_ID     : バックアップと検知通知を送る相手（DM）
 # NUKE_WHITELIST_BOT_IDS  : 検知の対象外にするBotのID（カンマ区切り・任意）
@@ -222,6 +230,9 @@ class SupportBot(commands.Bot):
         # 注文受付のボタン・セレクト・モーダルは on_interaction で custom_id から
         # 直接処理するため、再起動後も追加登録なしで動作する。
         logger.info("永続Viewの登録が完了しました。")
+
+        # 無言チケットの巡回（24時間注文がないチケットを自動で閉じて罰ロールを付ける）
+        self.loop.create_task(silent_ticket_loop())
 
         # Nuke対策（/nuke対策）。バックアップと通知は NUKE_BACKUP_USER_ID のDMに送る。
         # チケットは開閉で頻繁に増減するため、保存・復元の対象から外す。
@@ -2461,6 +2472,12 @@ class OpenTicketView(discord.ui.View):
             view=ClosedTicketView(),
         )
 
+        # 本人が注文せずに閉じた場合は罰ロールを付ける（スタッフが閉じた場合は対象外）
+        if owner_id and interaction.user.id == owner_id and not is_staff(interaction.user):
+            asyncio.create_task(
+                punish_if_no_order(channel, owner_id, "注文せずにチケットを閉じた")
+            )
+
 
 class ClosedTicketView(discord.ui.View):
     def __init__(self):
@@ -2501,6 +2518,13 @@ class ClosedTicketView(discord.ui.View):
             view=OpenTicketView(),
         )
 
+        # スタッフが再開したチケットは、無言チケットとして自動で閉じない
+        if channel.topic and not channel.topic.endswith(SILENT_TOPIC_FLAG):
+            try:
+                await channel.edit(topic=f"{channel.topic}{SILENT_TOPIC_FLAG}")
+            except discord.HTTPException as error:
+                log_http_error("再開したチケットの印付け", error)
+
     @discord.ui.button(
         label="チケットを削除",
         style=discord.ButtonStyle.danger,
@@ -2517,6 +2541,131 @@ class ClosedTicketView(discord.ui.View):
 
         await interaction.response.send_message("チケットを削除します。")
         await interaction.channel.delete()
+
+
+# ==========================================
+# 15-2. 無言チケット・注文なしクローズの罰
+# ==========================================
+
+# 「受付済み」以降まで進んだ注文は「注文した」とみなす（キャンセルは注文なし扱い）
+ORDERED_STATUSES = {"submitted", "link_sent", "received", "reported", "paid", "done"}
+
+no_order_notice_lock = asyncio.Lock()
+_last_no_order_notice = 0.0
+
+
+async def ticket_has_order(channel):
+    """チケット内の受付パネルに、注文まで進んだものが1つでもあるか。"""
+    async for message in channel.history(limit=500):
+        if message.author.id != bot.user.id:
+            continue
+        state = parse_order_message(message)
+        if state and state["status"] in ORDERED_STATUSES:
+            return True
+    return False
+
+
+async def send_no_order_notice():
+    """警告メッセージを送る。何人分あっても NO_ORDER_NOTICE_INTERVAL 秒に1回まで。"""
+    global _last_no_order_notice
+    async with no_order_notice_lock:
+        wait = NO_ORDER_NOTICE_INTERVAL - (asyncio.get_running_loop().time() - _last_no_order_notice)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        channel = bot.get_channel(NO_ORDER_NOTICE_CHANNEL_ID)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(NO_ORDER_NOTICE_CHANNEL_ID)
+            except discord.HTTPException as error:
+                log_http_error("無言チケット警告チャンネルの取得", error)
+                return
+        await safe_send(
+            channel,
+            f"<@&{NO_ORDER_ROLE_ID}>\n"
+            "無言チケットやめよ😅\n"
+            "-# 訳がある場合はチケットを開いてオーナーをメンションしてください",
+            allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+        )
+        _last_no_order_notice = asyncio.get_running_loop().time()
+
+
+async def punish_no_order(guild, user_id, reason):
+    """罰ロールを付けて警告を送る。すでにロールがある人には何もしない。"""
+    member = await fetch_ticket_owner_member(guild, user_id)
+    if member is None or is_staff(member):
+        return
+    role = guild.get_role(NO_ORDER_ROLE_ID)
+    if role is None:
+        logger.warning("罰ロール(%s)が見つかりません。", NO_ORDER_ROLE_ID)
+        return
+    if role in member.roles:
+        return
+    try:
+        await member.add_roles(role, reason=f"無言チケット対策: {reason}")
+    except discord.HTTPException as error:
+        log_http_error("無言チケットの罰ロール付与", error)
+        return
+    logger.info("罰ロールを付与: %s (%s) / %s", member, member.id, reason)
+    await send_no_order_notice()
+
+
+async def punish_if_no_order(channel, owner_id, reason):
+    try:
+        if not await ticket_has_order(channel):
+            await punish_no_order(channel.guild, owner_id, reason)
+    except discord.HTTPException as error:
+        log_http_error("注文なしクローズの確認", error)
+    except Exception as error:
+        log_unexpected_error("注文なしクローズの確認", error)
+
+
+def ticket_is_open(channel, owner_id):
+    """閉じたチケットは本人の送信権限が外されている。"""
+    return channel.overwrites_for(discord.Object(id=owner_id)).send_messages is not False
+
+
+async def close_silent_ticket(channel, owner_id):
+    # 先に印を付けて、スタッフが再開した後に何度も閉じられないようにする
+    await channel.edit(topic=f"{channel.topic}{SILENT_TOPIC_FLAG}")
+    owner = await fetch_ticket_owner_member(channel.guild, owner_id)
+    if owner is not None:
+        await channel.set_permissions(owner, send_messages=False)
+    await safe_send(
+        channel,
+        f"{SILENT_TICKET_HOURS}時間ご注文がなかったため、チケットを閉じました。",
+        view=ClosedTicketView(),
+    )
+    logger.info("無言チケットを自動で閉じました: #%s", channel.name)
+    await punish_no_order(channel.guild, owner_id, f"{SILENT_TICKET_HOURS}時間注文なし（無言チケット）")
+
+
+async def check_silent_tickets():
+    now = datetime.now(timezone.utc)
+    for guild in bot.guilds:
+        for channel in list(guild.text_channels):
+            if not is_ticket(channel) or channel.topic.endswith(SILENT_TOPIC_FLAG):
+                continue
+            if (now - channel.created_at).total_seconds() < SILENT_TICKET_HOURS * 3600:
+                continue
+            owner_id = get_ticket_owner(channel)
+            if not owner_id or not ticket_is_open(channel, owner_id):
+                continue
+            try:
+                if await ticket_has_order(channel):
+                    continue
+                await close_silent_ticket(channel, owner_id)
+            except discord.HTTPException as error:
+                log_http_error(f"無言チケットの処理 #{channel.name}", error)
+
+
+async def silent_ticket_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            await check_silent_tickets()
+        except Exception as error:
+            log_unexpected_error("無言チケットの巡回", error)
+        await asyncio.sleep(SILENT_CHECK_INTERVAL)
 
 
 # ==========================================
