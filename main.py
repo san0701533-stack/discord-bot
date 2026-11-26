@@ -2571,7 +2571,7 @@ async def send_no_order_notice():
         except discord.HTTPException as error:
             log_http_error("無言チケット警告チャンネルの取得", error)
             return
-    await safe_send(
+    return await safe_send(
         channel,
         f"<@&{NO_ORDER_ROLE_ID}>\n"
         "無言チケットやめよ😅\n"
@@ -2582,11 +2582,20 @@ async def send_no_order_notice():
 
 async def no_order_notice_loop():
     await bot.wait_until_ready()
+    logger.info(
+        "無言チケット警告の定期送信を開始: チャンネル=%s / 間隔=%s秒",
+        NO_ORDER_NOTICE_CHANNEL_ID,
+        NO_ORDER_NOTICE_INTERVAL,
+    )
     loop = asyncio.get_running_loop()
+    first_send_logged = False
     while not bot.is_closed():
         started_at = loop.time()
         try:
-            await send_no_order_notice()
+            sent = await send_no_order_notice()
+            if sent is not None and not first_send_logged:
+                logger.info("無言チケット警告の初回送信成功: メッセージID=%s", sent.id)
+                first_send_logged = True
         except Exception as error:
             log_unexpected_error("無言チケット警告の定期送信", error)
         elapsed = loop.time() - started_at
