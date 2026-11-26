@@ -233,6 +233,7 @@ class SupportBot(commands.Bot):
 
         # 無言チケットの巡回（24時間注文がないチケットを自動で閉じて罰ロールを付ける）
         self.loop.create_task(silent_ticket_loop())
+        self.loop.create_task(no_order_notice_loop())
 
         # Nuke対策（/nuke対策）。バックアップと通知は NUKE_BACKUP_USER_ID のDMに送る。
         # チケットは開閉で頻繁に増減するため、保存・復元の対象から外す。
@@ -2756,10 +2757,6 @@ class ClosedTicketView(discord.ui.View):
 # 「受付済み」以降まで進んだ注文は「注文した」とみなす（キャンセルは注文なし扱い）
 ORDERED_STATUSES = {"submitted", "link_sent", "received", "reported", "paid", "done"}
 
-no_order_notice_lock = asyncio.Lock()
-_last_no_order_notice = 0.0
-
-
 async def ticket_has_order(channel):
     """チケット内の受付パネルに、注文まで進んだものが1つでもあるか。"""
     async for message in channel.history(limit=500):
@@ -2772,31 +2769,47 @@ async def ticket_has_order(channel):
 
 
 async def send_no_order_notice():
-    """警告メッセージを送る。何人分あっても NO_ORDER_NOTICE_INTERVAL 秒に1回まで。"""
-    global _last_no_order_notice
-    async with no_order_notice_lock:
-        wait = NO_ORDER_NOTICE_INTERVAL - (asyncio.get_running_loop().time() - _last_no_order_notice)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        channel = bot.get_channel(NO_ORDER_NOTICE_CHANNEL_ID)
-        if channel is None:
-            try:
-                channel = await bot.fetch_channel(NO_ORDER_NOTICE_CHANNEL_ID)
-            except discord.HTTPException as error:
-                log_http_error("無言チケット警告チャンネルの取得", error)
-                return
-        await safe_send(
-            channel,
-            f"<@&{NO_ORDER_ROLE_ID}>\n"
-            "無言チケットやめよ😅\n"
-            "-# 訳がある場合はチケットを開いてオーナーをメンションしてください",
-            allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
-        )
-        _last_no_order_notice = asyncio.get_running_loop().time()
+    """設定されたチャンネルに警告メッセージを送る。"""
+    channel = bot.get_channel(NO_ORDER_NOTICE_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(NO_ORDER_NOTICE_CHANNEL_ID)
+        except discord.HTTPException as error:
+            log_http_error("無言チケット警告チャンネルの取得", error)
+            return
+    return await safe_send(
+        channel,
+        f"<@&{NO_ORDER_ROLE_ID}>\n"
+        "無言チケットやめよ😅\n"
+        "-# 訳がある場合はチケットを開いてオーナーをメンションしてください",
+        allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+    )
+
+
+async def no_order_notice_loop():
+    await bot.wait_until_ready()
+    logger.info(
+        "無言チケット警告の定期送信を開始: チャンネル=%s / 間隔=%s秒",
+        NO_ORDER_NOTICE_CHANNEL_ID,
+        NO_ORDER_NOTICE_INTERVAL,
+    )
+    loop = asyncio.get_running_loop()
+    first_send_logged = False
+    while not bot.is_closed():
+        started_at = loop.time()
+        try:
+            sent = await send_no_order_notice()
+            if sent is not None and not first_send_logged:
+                logger.info("無言チケット警告の初回送信成功: メッセージID=%s", sent.id)
+                first_send_logged = True
+        except Exception as error:
+            log_unexpected_error("無言チケット警告の定期送信", error)
+        elapsed = loop.time() - started_at
+        await asyncio.sleep(max(0, NO_ORDER_NOTICE_INTERVAL - elapsed))
 
 
 async def punish_no_order(guild, user_id, reason):
-    """罰ロールを付けて警告を送る。すでにロールがある人には何もしない。"""
+    """罰ロールを付ける。すでにロールがある人には何もしない。"""
     member = await fetch_ticket_owner_member(guild, user_id)
     if member is None or is_staff(member):
         return
@@ -2812,7 +2825,6 @@ async def punish_no_order(guild, user_id, reason):
         log_http_error("無言チケットの罰ロール付与", error)
         return
     logger.info("罰ロールを付与: %s (%s) / %s", member, member.id, reason)
-    await send_no_order_notice()
 
 
 async def punish_if_no_order(channel, owner_id, reason):
