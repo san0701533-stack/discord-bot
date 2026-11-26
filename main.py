@@ -519,7 +519,7 @@ COLOR_VOID = 0x18181B   # 黒（キャンセル）
 DIVIDER = "━━━━━━━━━━━━━━━━━━━━━━"
 EMPTY = "―"
 
-CATEGORY_LABELS = {"boost": "代行", "cheat": "チート"}
+CATEGORY_LABELS = {"boost": "代行", "cheat": "チート", "middle": "仲介"}
 SERVICE_LABELS = {"trophy": "トロ上げ代行", "ranked": "ガチバ代行"}
 PAYMENT_LABELS = {"paypay": "PayPay", "ltc": "LTC（仮想通貨）"}
 LTC_ADDRESS = "LbuHqe7Uy5NgqGYi2AT544aY41CcYiSMcs"
@@ -529,6 +529,13 @@ PAYPAY_CHEAT_USER_ID = 1462791798891090084   # 「チート」のリンク受け
 # 「代行」のリンクを PAYPAY_BOOST_USER_ID へ送ったことを知らせる相手（金額などを通知）
 PAYPAY_NOTIFY_USER_ID = 1462791798891090084
 PAYPAY_RECIPIENT_IDS = {PAYPAY_BOOST_USER_ID, PAYPAY_CHEAT_USER_ID}
+# 「仲介」: 手数料は固定。PayPayリンクは代行・チート両方の受け取り先へDMする
+MIDDLE_FEE = 200
+PAYPAY_MIDDLE_USER_IDS = (PAYPAY_BOOST_USER_ID, PAYPAY_CHEAT_USER_ID)
+# 「代行」の受け取り確認時に通知する取り分（2割）と、受け取り先の呼び名
+BOOST_SHARE_PERCENT = 20
+BOOST_RECIPIENT_NAME = "たまごっち"
+PARTNER_ID_RE = re.compile(r"（(\d{15,20})）$")
 PAYPAY_AMOUNT_MAX = 10_000_000
 PAYPAY_URL_RE = re.compile(r"https?://pay\.paypay\.ne\.jp/[A-Za-z0-9_-]+", re.IGNORECASE)
 DEVICE_LABELS = {"ios": "iOS", "android": "Android"}
@@ -556,11 +563,43 @@ paypay_dm_sent_panels = set()
 paypay_confirmed_panels = set()
 
 
-def paypay_recipient_id(state):
-    """区分に応じたPayPayリンクのDM送信先。"""
-    if state["answers"].get("category") == "cheat":
-        return PAYPAY_CHEAT_USER_ID
-    return PAYPAY_BOOST_USER_ID
+def paypay_recipient_ids(state):
+    """区分に応じたPayPayリンクのDM送信先（複数可）。"""
+    category = state["answers"].get("category")
+    if category == "middle":
+        return list(PAYPAY_MIDDLE_USER_IDS)
+    if category == "cheat":
+        return [PAYPAY_CHEAT_USER_ID]
+    return [PAYPAY_BOOST_USER_ID]
+
+
+def boost_share(price):
+    """代行の金額のうち、通知先が受け取れる分（2割）。"""
+    return price * BOOST_SHARE_PERCENT // 100
+
+
+def partner_id_from(text):
+    match = PARTNER_ID_RE.search(text or "")
+    return int(match.group(1)) if match else None
+
+
+def resolve_partner(guild, text):
+    """入力されたユーザーネーム・メンション・IDから、サーバーのメンバーを探す。"""
+    text = unicodedata.normalize("NFKC", text or "").strip().lstrip("@")
+    if not text or guild is None:
+        return None
+    match = re.fullmatch(r"<@!?(\d+)>|(\d{15,20})", text)
+    if match:
+        return guild.get_member(int(match.group(1) or match.group(2)))
+    member = guild.get_member_named(text)
+    if member is not None:
+        return member
+    lowered = text.lower()
+    for member in guild.members:
+        names = (member.name, member.global_name, member.nick)
+        if any(n and n.lower() == lowered for n in names):
+            return member
+    return None
 
 
 def parse_yen_amount(text):
@@ -587,6 +626,7 @@ FIELD_LABELS = {
     "note": "備考",
     "device": "端末",
     "detail": "相談内容",
+    "partner": "取引相手",
 }
 LABEL_TO_KEY = {v: k for k, v in FIELD_LABELS.items()}
 
@@ -604,6 +644,7 @@ def step_title(state, step):
         "payment": "お支払い方法",
         "device": "ご利用端末",
         "detail": "ご相談内容",
+        "partner": "取引相手",
         "confirm": "最終確認",
     }
     return titles.get(step, step)
@@ -628,6 +669,8 @@ def step_sequence(state):
     seq = ["category"]
     if answers.get("category") == "cheat":
         seq += ["device", "detail"]
+    elif answers.get("category") == "middle":
+        seq += ["partner"]
     elif answers.get("category") == "boost":
         seq += ["service", "start", "goal"]
         # ガチバ代行は現在ランク・目標ランクの入力後に注文内容を確定し、
@@ -640,6 +683,8 @@ def step_sequence(state):
 
 def order_quote(state):
     answers = state["answers"]
+    if answers.get("category") == "middle":
+        return MIDDLE_FEE
     if answers.get("category") != "boost":
         return None
     start, goal = answers.get("start"), answers.get("goal")
@@ -668,6 +713,8 @@ def step_done(state, step):
         return answers.get("device") in DEVICE_LABELS
     if step == "detail":
         return bool(answers.get("detail"))
+    if step == "partner":
+        return partner_id_from(answers.get("partner")) is not None
     return True
 
 
@@ -760,6 +807,8 @@ def summary_keys(state):
     category = answers.get("category")
     if category == "cheat":
         return ["category", "device", "detail", "payment"]
+    if category == "middle":
+        return ["category", "partner", "payment"]
     if category == "boost":
         keys = ["category", "service"]
         service = answers.get("service")
@@ -938,6 +987,12 @@ def build_order_embed(state, title, body, *, header=None, color=COLOR_MAIN):
             value=box("スタッフが個別にご案内します"),
             inline=False,
         )
+    elif category == "middle":
+        embed.add_field(
+            name="✦ 仲介手数料",
+            value=box(f"¥ {MIDDLE_FEE:,}"),
+            inline=False,
+        )
 
     embed.set_footer(
         text=f"ORDER #{state['order_id']} ・ {STATUS_TEXT[state['status']]}"
@@ -985,7 +1040,9 @@ def render_step(state, step, ret="n"):
             "⚡ **代行**\n"
             "　└ トロ上げ代行・ガチバトル代行（料金を自動計算）\n"
             "🧩 **チート**\n"
-            "　└ ご相談内容を伺い、スタッフが個別にご案内します"
+            "　└ ご相談内容を伺い、スタッフが個別にご案内します\n"
+            "🤝 **仲介**\n"
+            f"　└ お取引の仲介をします（手数料 ¥{MIDDLE_FEE:,}）"
         )
         selected = answers.get("category")
         items += [
@@ -993,6 +1050,8 @@ def render_step(state, step, ret="n"):
                     style=_choice_style(selected, "boost", True)),
             _button("チート", f"ord:set:category:cheat:{ret}", emoji="🧩", row=0,
                     style=_choice_style(selected, "cheat", False)),
+            _button("仲介", f"ord:set:category:middle:{ret}", emoji="🤝", row=0,
+                    style=_choice_style(selected, "middle", False)),
         ]
 
     elif step == "service":
@@ -1166,6 +1225,27 @@ def render_step(state, step, ret="n"):
         ))
         show_next = done
 
+    elif step == "partner":
+        title = f"{prefix}取引相手を入力してください"
+        current = answers.get("partner")
+        body = (
+            "下のボタンから、取引したい相手の **ユーザーネーム** を入力してください。\n"
+            "相手はこのサーバーに参加している必要があります。\n\n"
+            f"◆ 仲介手数料：**¥{MIDDLE_FEE:,}**（PayPay）\n"
+            "◆ PayPayリンクの送信後、取引相手がこのチケットを見られるようになり、スタッフが対応します。"
+        )
+        if current:
+            body += f"\n\n現在の取引相手：**{current}**"
+        done = step_done(state, step)
+        items.append(_button(
+            "取引相手を変更する" if done else "取引相手を入力する",
+            f"ord:open:partner:{ret}",
+            style=discord.ButtonStyle.secondary if done else discord.ButtonStyle.primary,
+            emoji="🤝",
+            row=0,
+        ))
+        show_next = done
+
     else:
         return render_panel(state)
 
@@ -1252,7 +1332,20 @@ def render_status(state):
     # 旧フロー（支払い方法なし）で送信済みのチート相談は、従来の画面のまま扱う
     has_payment_flow = not is_cheat or bool(state["answers"].get("payment"))
 
-    if status == "payment_select":
+    if status == "payment_select" and state["answers"].get("category") == "middle":
+        title = "お支払い専用メニュー"
+        body = (
+            f"{price_heading}"
+            "仲介手数料のお支払いはPayPayのみです。\n\n"
+            "💳 **PayPay**　選択すると受け取りリンクの入力画面が開きます。リンクはチケットに表示されません。\n"
+            "リンクを送信すると、取引相手がこのチケットを見られるようになり、スタッフが対応します。"
+        )
+        items.extend([
+            _button("PayPay", "ord:pay:paypay", style=discord.ButtonStyle.primary, emoji="💳", row=0),
+            _button("注文を取り消す", "ord:cancel:payment", emoji="✖️", row=1),
+        ])
+
+    elif status == "payment_select":
         title = "お支払い専用メニュー"
         body = (
             f"{price_heading}"
@@ -1453,6 +1546,24 @@ def build_detail_modal(state, ret):
     return modal
 
 
+def build_partner_modal(state, ret):
+    modal = discord.ui.Modal(
+        title="取引相手の入力",
+        custom_id=f"ord:modal:partner:{ret}",
+        timeout=600,
+    )
+    current = state["answers"].get("partner") or ""
+    modal.add_item(discord.ui.TextInput(
+        label="取引相手のユーザーネーム",
+        custom_id="partner",
+        placeholder="例：tamagotchi_123（@は不要です）",
+        default=PARTNER_ID_RE.sub("", current) or None,
+        required=True,
+        max_length=40,
+    ))
+    return modal
+
+
 class PayPayLinkModal(discord.ui.Modal):
     def __init__(self, channel_id, message_id, *, ask_amount=False):
         super().__init__(
@@ -1545,7 +1656,7 @@ def build_staff_embed(state, ticket_channel, title, panel_url=None, handled_by=N
             value=box(text or EMPTY),
             inline=key not in ("note", "detail"),
         )
-    if state["answers"].get("category") == "boost":
+    if state["answers"].get("category") in ("boost", "middle"):
         price = order_quote(state)
         embed.add_field(
             name="金額",
@@ -1739,7 +1850,12 @@ async def handle_customer_action(interaction, parts):
 
     if action == "open":           # ord:open:<info|detail>:<ret>
         key, ret = parts[2], parts[3]
-        modal = build_info_modal(state, ret) if key == "info" else build_detail_modal(state, ret)
+        if key == "info":
+            modal = build_info_modal(state, ret)
+        elif key == "partner":
+            modal = build_partner_modal(state, ret)
+        else:
+            modal = build_detail_modal(state, ret)
         await interaction.response.send_modal(modal)
         return
 
@@ -1760,6 +1876,17 @@ async def handle_customer_action(interaction, parts):
                 state["answers"].pop("tag", None)
                 state["answers"].pop("brawler", None)
             state["answers"]["note"] = clean_text(values.get("note"), 300) or "なし"
+        elif key == "partner":
+            partner = resolve_partner(interaction.guild, clean_text(values.get("partner"), 40))
+            if partner is None:
+                return await _ephemeral(
+                    interaction,
+                    "そのユーザーネームの人がこのサーバーに見つかりませんでした。\n"
+                    "相手のユーザーネーム（表示名ではなく `@` の後ろの名前）を確認して、もう一度入力してください。",
+                )
+            if partner.id == owner_id or partner.bot:
+                return await _ephemeral(interaction, "取引相手には、ご自身とBot以外のユーザーを入力してください。")
+            state["answers"]["partner"] = f"{partner.name}（{partner.id}）"
         else:
             detail = clean_text(values.get("detail"), 800)
             if not detail:
@@ -1825,6 +1952,8 @@ async def handle_customer_action(interaction, parts):
         payment = parts[2] if len(parts) > 2 else None
         if state["status"] != "payment_select" or payment not in PAYMENT_LABELS:
             return await _ephemeral(interaction, "この画面では支払い方法を選択できません。")
+        if state["answers"].get("category") == "middle" and payment != "paypay":
+            return await _ephemeral(interaction, "仲介のお支払いはPayPayのみです。")
         if payment == "paypay":
             # PayPay選択だけでは処理を完了させず、すぐに受け取りリンクの入力画面を開く。
             # 状態の更新・スタッフ通知はリンク送信後の段階で行う（ここでは通知しない）。
@@ -1944,6 +2073,62 @@ def _paypay_link_input_allowed(state):
     return state["status"] == "submitted" and state["answers"].get("payment") == "paypay"
 
 
+async def add_middle_partner(channel, panel, state, partner_id):
+    """仲介：取引相手にチケットを見られるようにして、スタッフをメンションする。"""
+    partner = await fetch_ticket_owner_member(channel.guild, partner_id) if partner_id else None
+    if partner is None:
+        await safe_send(
+            channel,
+            f"⚠️ 取引相手（{state['answers'].get('partner') or '不明'}）がサーバーに見つからないため、"
+            f"チケットに追加できませんでした。{staff_mentions(channel.guild)}",
+        )
+        return
+    try:
+        await channel.set_permissions(
+            partner,
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            attach_files=True,
+        )
+    except discord.HTTPException as error:
+        log_http_error("仲介の取引相手をチケットに追加", error)
+        await safe_send(
+            channel,
+            f"⚠️ 取引相手 {partner.mention} をチケットに追加できませんでした。{staff_mentions(channel.guild)}",
+        )
+        return
+    staff_embed = build_staff_embed(state, channel, "🤝 仲介の取引が始まりました", panel.jump_url)
+    await safe_send(
+        channel,
+        f"🤝 取引相手 {partner.mention} をこのチケットに追加しました。\n"
+        f"スタッフの対応をお待ちください。{staff_mentions(channel.guild)}",
+        embed=staff_embed,
+        view=staff_view(state, channel.id, panel.id),
+    )
+    logger.info("仲介の取引相手を追加: #%s partner=%s", state["order_id"], partner.id)
+
+
+async def notify_boost_share(state):
+    """代行の受け取り確認時に、通知先へ金額と2割を知らせる。"""
+    price = order_quote(state)
+    if price is None:
+        return
+    share = boost_share(price)
+    text = (
+        f"<@{PAYPAY_NOTIFY_USER_ID}>\n"
+        f"{BOOST_RECIPIENT_NAME}さんが¥{price:,}受け取りました。\n"
+        f"あなたは¥{share:,}受け取れます。\n"
+        f"¥{price:,}受け取れますが、その2割を俺に送って\n"
+        f"注文ID：#{state['order_id']}"
+    )
+    try:
+        user = bot.get_user(PAYPAY_NOTIFY_USER_ID) or await bot.fetch_user(PAYPAY_NOTIFY_USER_ID)
+        await user.send(text, allowed_mentions=discord.AllowedMentions(users=True))
+    except discord.HTTPException as error:
+        log_http_error("代行の2割通知DM", error)
+
+
 async def handle_customer_paypay_action(interaction, parts):
     """PayPay受け取りフロー。
 
@@ -2019,7 +2204,8 @@ async def handle_customer_paypay_action(interaction, parts):
                     )
             else:
                 price = order_quote(state)
-            recipient_id = paypay_recipient_id(state)
+            recipient_ids = paypay_recipient_ids(state)
+            is_middle = state["answers"].get("category") == "middle"
             category_label = CATEGORY_LABELS.get(state["answers"].get("category"), EMPTY)
 
             # 段階1：PayPay選択を確定し「リンク入力待ち」にする（DM失敗時はこの画面に留まる）
@@ -2034,33 +2220,43 @@ async def handle_customer_paypay_action(interaction, parts):
                     return await _ephemeral(interaction, "お支払い画面を更新できませんでした。もう一度お試しください。")
 
             # 段階2：指定ユーザーへDM送信（メンション付き・確認ボタン付き）
-            dm_text = (
-                f"<@{recipient_id}>\n"
-                "💳 **PayPay受け取りリンクが届きました**\n"
-                f"注文ID：#{state['order_id']}\n"
-                f"区分：{category_label}\n"
-            )
-            if price is not None:
-                dm_text += f"金額：¥{price:,}" + ("（お客様の申告額）\n" if is_cheat else "\n")
-            dm_text += (
-                f"チケット：{channel.mention}（{channel.name}）\n"
-                f"お客様：<@{state['owner_id']}>（ID: {state['owner_id']}）\n"
-                f"リンク：{link}\n\n"
-                "**受け取りましたか？**\n"
-                "受け取りが完了したら、下の「受け取りました」ボタンを押してください。"
-            )
-            try:
-                recipient = bot.get_user(recipient_id)
-                if recipient is None:
-                    recipient = await bot.fetch_user(recipient_id)
-                await recipient.send(
-                    dm_text,
-                    view=_paypay_dm_view(channel.id, panel.id, order_id=state["order_id"]),
-                    allowed_mentions=discord.AllowedMentions(users=True),
+            partner_id = partner_id_from(state["answers"].get("partner")) if is_middle else None
+            sent_to = []
+            for recipient_id in recipient_ids:
+                dm_text = (
+                    f"<@{recipient_id}>\n"
+                    "💳 **PayPay受け取りリンクが届きました**\n"
+                    f"注文ID：#{state['order_id']}\n"
+                    f"区分：{category_label}\n"
                 )
-            except discord.HTTPException as error:
-                log_http_error("PayPayリンクのDM送信", error)
-                # DM失敗時は受け取り確認待ちに進めない（状態は「リンク入力待ち」のまま）
+                if price is not None:
+                    dm_text += f"金額：¥{price:,}" + ("（お客様の申告額）\n" if is_cheat else "\n")
+                    if state["answers"].get("category") == "boost":
+                        dm_text += f"2割：¥{boost_share(price):,}\n"
+                if partner_id:
+                    dm_text += f"取引相手：<@{partner_id}>（ID: {partner_id}）\n"
+                dm_text += (
+                    f"チケット：{channel.mention}（{channel.name}）\n"
+                    f"お客様：<@{state['owner_id']}>（ID: {state['owner_id']}）\n"
+                    f"リンク：{link}\n\n"
+                    "**受け取りましたか？**\n"
+                    "受け取りが完了したら、下の「受け取りました」ボタンを押してください。"
+                )
+                try:
+                    recipient = bot.get_user(recipient_id)
+                    if recipient is None:
+                        recipient = await bot.fetch_user(recipient_id)
+                    await recipient.send(
+                        dm_text,
+                        view=_paypay_dm_view(channel.id, panel.id, order_id=state["order_id"]),
+                        allowed_mentions=discord.AllowedMentions(users=True),
+                    )
+                    sent_to.append(recipient_id)
+                except discord.HTTPException as error:
+                    log_http_error(f"PayPayリンクのDM送信（{recipient_id}）", error)
+
+            if not sent_to:
+                # 全員へのDMに失敗した場合は受け取り確認待ちに進めない（状態は「リンク入力待ち」のまま）
                 return await _ephemeral(
                     interaction,
                     "⚠️ リンクの送信に失敗しました。リンクは転送されていません。\n"
@@ -2068,11 +2264,14 @@ async def handle_customer_paypay_action(interaction, parts):
                 )
 
             paypay_dm_sent_panels.add((message_id, state["order_id"]))
-            logger.info("PayPayリンクDM送信: #%s → %s", state["order_id"], recipient_id)
+            logger.info("PayPayリンクDM送信: #%s → %s", state["order_id"], sent_to)
+            recipient_id = sent_to[0]
 
             # 代行のリンクを受け取り先へ送ったことを、通知先ユーザーへDMで知らせる
             # （リンク自体は含めない。失敗しても注文の進行は止めない）
-            if recipient_id == PAYPAY_BOOST_USER_ID and PAYPAY_NOTIFY_USER_ID != recipient_id:
+            if (state["answers"].get("category") == "boost"
+                    and recipient_id == PAYPAY_BOOST_USER_ID
+                    and PAYPAY_NOTIFY_USER_ID != recipient_id):
                 service_label = SERVICE_LABELS.get(state["answers"].get("service"), EMPTY)
                 notify_text = (
                     f"<@{PAYPAY_NOTIFY_USER_ID}>\n"
@@ -2108,6 +2307,8 @@ async def handle_customer_paypay_action(interaction, parts):
                 "現在、担当者が受け取りを確認しています。確認が取れ次第スタッフが対応しますので、しばらくお待ちください。",
                 allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
             )
+            if is_middle:
+                await add_middle_partner(channel, panel, state, partner_id)
 
         return await _ephemeral(
             interaction,
@@ -2174,7 +2375,9 @@ async def handle_customer_paypay_action(interaction, parts):
             logger.info("PayPay受け取り確認: #%s by %s", state["order_id"], interaction.user.id)
 
             # ボタン押下後にのみ、チケット内でスタッフへメンション
-            mentions = staff_mentions(channel.guild)
+            # （仲介はリンク送信時にメンション済みのため、ここではメンションしない）
+            is_middle = state["answers"].get("category") == "middle"
+            mentions = "" if is_middle else staff_mentions(channel.guild)
             staff_embed = build_staff_embed(
                 state, channel, "✅ PayPay受け取り確認済み", panel.jump_url, interaction.user,
             )
@@ -2184,6 +2387,9 @@ async def handle_customer_paypay_action(interaction, parts):
                 embed=staff_embed,
                 view=staff_view(state, channel.id, panel.id),
             )
+
+            if state["answers"].get("category") == "boost" and interaction.user.id == PAYPAY_BOOST_USER_ID:
+                await notify_boost_share(state)
 
             await interaction.edit_original_response(view=_paypay_dm_view(0, 0, confirmed=True))
 
@@ -2702,6 +2908,7 @@ async def setup_ticket(ctx):
             f"{DIVIDER}\n"
             "⚡ **代行**　─　トロ上げ / ガチバトル（料金自動計算）\n"
             "🧩 **チート**　─　スタッフが個別にご案内\n"
+            f"🤝 **仲介**　─　お取引の仲介（手数料 ¥{MIDDLE_FEE:,}）\n"
             f"{DIVIDER}\n"
             "ボタンを選ぶだけで、ご注文からお支払いまで完結します。"
         ),
