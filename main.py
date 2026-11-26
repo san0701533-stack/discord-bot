@@ -200,7 +200,7 @@ PAYPAY_LINKS = _parse_paypay_links()
 # ---- 無言チケット・注文なしクローズの罰 ----
 NO_ORDER_ROLE_ID = 1575153786266325062        # 付けるロール
 NO_ORDER_NOTICE_CHANNEL_ID = 1575153532619726908  # 警告を送るチャンネル
-NO_ORDER_NOTICE_INTERVAL = 10                 # 警告メッセージの送信間隔（秒）
+NO_ORDER_NOTICE_INTERVAL = 5                 # 警告メッセージの送信間隔（秒）
 SILENT_TICKET_HOURS = 24                      # この時間注文がなければ無言チケット
 SILENT_CHECK_INTERVAL = 600                   # 無言チケットを確認する間隔（秒）
 SILENT_TOPIC_FLAG = ":silent"                 # 無言で自動クローズ済みの印（チャンネルトピック）
