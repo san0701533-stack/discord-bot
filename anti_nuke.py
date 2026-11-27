@@ -768,7 +768,7 @@ def _permission_warnings(guild):
     return lines
 
 
-def setup_anti_nuke(bot, *, backup_user_id, exclude_channel=None, whitelist_bot_ids=()):
+def setup_anti_nuke(bot, *, backup_user_id, exclude_channel=None, whitelist_bot_ids=(), command_user_ids=None):
     guard = AntiNuke(bot, backup_user_id, exclude_channel, whitelist_bot_ids)
 
     async def on_ready():
@@ -827,8 +827,12 @@ def setup_anti_nuke(bot, *, backup_user_id, exclude_channel=None, whitelist_bot_
         user = interaction.user
         if guild is None:
             return
-        if not (user.id == guild.owner_id or user.guild_permissions.administrator):
-            await interaction.response.send_message("このコマンドは管理者のみ使用できます。", ephemeral=True)
+        if command_user_ids is not None:
+            allowed = user.id in command_user_ids
+        else:
+            allowed = user.id == guild.owner_id or user.guild_permissions.administrator
+        if not allowed:
+            await interaction.response.send_message("このコマンドを使う権限がありません。", ephemeral=True)
             return
 
         value = action.value if action else "enable"

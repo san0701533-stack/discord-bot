@@ -205,6 +205,10 @@ SILENT_TICKET_HOURS = 24                      # この時間注文がなけれ�
 SILENT_CHECK_INTERVAL = 600                   # 無言チケットを確認する間隔（秒）
 SILENT_TOPIC_FLAG = ":silent"                 # 無言で自動クローズ済みの印（チャンネルトピック）
 
+# ---- コマンドを使える人 ----
+# !setup_ticket・!order_panel・/nuke対策 はこのユーザーだけが使える
+COMMAND_OWNER_ID = 1462791798891090084
+
 # ---- Nuke対策 ----
 # NUKE_BACKUP_USER_ID     : バックアップと検知通知を送る相手（DM）
 # NUKE_WHITELIST_BOT_IDS  : 検知の対象外にするBotのID（カンマ区切り・任意）
@@ -242,6 +246,7 @@ class SupportBot(commands.Bot):
             backup_user_id=NUKE_BACKUP_USER_ID,
             exclude_channel=is_ticket,
             whitelist_bot_ids=NUKE_WHITELIST_BOT_IDS,
+            command_user_ids={COMMAND_OWNER_ID},
         )
         try:
             synced = await self.tree.sync()
@@ -332,6 +337,10 @@ def is_staff(member):
     if not isinstance(member, discord.Member):
         return False
     return any(role.id in STAFF_ROLES for role in member.roles)
+
+
+def is_command_owner(user):
+    return user is not None and user.id == COMMAND_OWNER_ID
 
 
 def is_ticket(channel):
@@ -3026,7 +3035,7 @@ async def on_ready():
 
 @bot.command()
 async def setup_ticket(ctx):
-    if not is_staff(ctx.author):
+    if not is_command_owner(ctx.author):
         return
 
     # ゴールドのバナー＋メニューで種類を選ぶパネル（以前に出したボタンのパネルも引き続き動く）
@@ -3036,7 +3045,7 @@ async def setup_ticket(ctx):
 @bot.command()
 async def order_panel(ctx):
     """チケット内に受付パネルを出し直す（スタッフ用）。"""
-    if not is_staff(ctx.author):
+    if not is_command_owner(ctx.author):
         return
     owner_id = get_ticket_owner(ctx.channel)
     if owner_id is None:
