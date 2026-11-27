@@ -158,7 +158,8 @@ STAFF_ROLES = [
 
 TICKET_CATEGORY = "チケット"
 
-# チケットを閲覧でき、「チケットを削除」も押せる追加のユーザー・ロール（どちらのIDでもよい）
+# スタッフと同じ扱いにする追加のユーザー・ロール（どちらのIDでもよい）
+# チケットの閲覧・書き込み・閉じる/再開/削除・注文の状態変更ができ、スタッフ通知でもメンションされる
 TICKET_EXTRA_ACCESS_IDS = [
     1571087140886937672,
 ]
@@ -341,19 +342,13 @@ TROPHY_PRICES = {
 def is_staff(member):
     if not isinstance(member, discord.Member):
         return False
-    return any(role.id in STAFF_ROLES for role in member.roles)
+    if member.id in TICKET_EXTRA_ACCESS_IDS:
+        return True
+    return any(role.id in STAFF_ROLES or role.id in TICKET_EXTRA_ACCESS_IDS for role in member.roles)
 
 
 def is_command_owner(user):
     return user is not None and user.id == COMMAND_OWNER_ID
-
-
-def has_ticket_extra_access(member):
-    if member is None:
-        return False
-    if member.id in TICKET_EXTRA_ACCESS_IDS:
-        return True
-    return any(role.id in TICKET_EXTRA_ACCESS_IDS for role in getattr(member, "roles", []))
 
 
 async def ticket_extra_access_targets(guild):
@@ -371,11 +366,17 @@ async def ticket_extra_access_targets(guild):
     return targets
 
 
-TICKET_EXTRA_ACCESS_PERMS = {"view_channel": True, "read_message_history": True}
+# スタッフロールと同じ権限
+TICKET_EXTRA_ACCESS_PERMS = {
+    "view_channel": True,
+    "send_messages": True,
+    "read_message_history": True,
+    "manage_channels": True,
+}
 
 
 async def grant_extra_access_to_existing_tickets():
-    """起動時に、すでにあるチケットにも追加のユーザー・ロールの閲覧権限を付ける。"""
+    """起動時に、すでにあるチケットにも追加のユーザー・ロールへスタッフと同じ権限を付ける。"""
     for guild in bot.guilds:
         targets = await ticket_extra_access_targets(guild)
         if not targets:
@@ -385,7 +386,7 @@ async def grant_extra_access_to_existing_tickets():
                 continue
             for target in targets:
                 current = channel.overwrites_for(target)
-                if current.view_channel and current.read_message_history:
+                if all(getattr(current, name) is value for name, value in TICKET_EXTRA_ACCESS_PERMS.items()):
                     continue
                 try:
                     await channel.set_permissions(target, **TICKET_EXTRA_ACCESS_PERMS)
@@ -435,6 +436,9 @@ def staff_mentions(guild):
         role = guild.get_role(role_id)
         if role:
             mentions.append(role.mention)
+    for target_id in TICKET_EXTRA_ACCESS_IDS:
+        role = guild.get_role(target_id)
+        mentions.append(role.mention if role else f"<@{target_id}>")
     return " ".join(mentions)
 
 
@@ -3031,7 +3035,7 @@ class ClosedTicketView(discord.ui.View):
         custom_id="ticket:delete",
     )
     async def delete_ticket(self, interaction, button):
-        if not (is_staff(interaction.user) or has_ticket_extra_access(interaction.user)):
+        if not is_staff(interaction.user):
             await interaction.response.send_message(
                 "スタッフのみ操作できます。",
                 ephemeral=True,
