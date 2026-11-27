@@ -158,6 +158,11 @@ STAFF_ROLES = [
 
 TICKET_CATEGORY = "チケット"
 
+# チケットを閲覧でき、「チケットを削除」も押せる追加のユーザー・ロール（どちらのIDでもよい）
+TICKET_EXTRA_ACCESS_IDS = [
+    1571087140886937672,
+]
+
 # ---- 注文受付まわりの設定（すべて任意） ----
 # BRAND_NAME        : Embedに表示するサービス名
 # PAYPAY_LINK       : PayPay受け取りリンク（共通）
@@ -341,6 +346,51 @@ def is_staff(member):
 
 def is_command_owner(user):
     return user is not None and user.id == COMMAND_OWNER_ID
+
+
+def has_ticket_extra_access(member):
+    if member is None:
+        return False
+    if member.id in TICKET_EXTRA_ACCESS_IDS:
+        return True
+    return any(role.id in TICKET_EXTRA_ACCESS_IDS for role in getattr(member, "roles", []))
+
+
+async def ticket_extra_access_targets(guild):
+    """追加で閲覧できるユーザー・ロールを、サーバー内のロールかメンバーとして取り出す。"""
+    targets = []
+    for target_id in TICKET_EXTRA_ACCESS_IDS:
+        target = guild.get_role(target_id) or guild.get_member(target_id)
+        if target is None:
+            try:
+                target = await guild.fetch_member(target_id)
+            except discord.HTTPException:
+                logger.warning("チケット閲覧の追加先(%s)がサーバーに見つかりません。", target_id)
+                continue
+        targets.append(target)
+    return targets
+
+
+TICKET_EXTRA_ACCESS_PERMS = {"view_channel": True, "read_message_history": True}
+
+
+async def grant_extra_access_to_existing_tickets():
+    """起動時に、すでにあるチケットにも追加のユーザー・ロールの閲覧権限を付ける。"""
+    for guild in bot.guilds:
+        targets = await ticket_extra_access_targets(guild)
+        if not targets:
+            continue
+        for channel in list(guild.text_channels):
+            if not is_ticket(channel):
+                continue
+            for target in targets:
+                current = channel.overwrites_for(target)
+                if current.view_channel and current.read_message_history:
+                    continue
+                try:
+                    await channel.set_permissions(target, **TICKET_EXTRA_ACCESS_PERMS)
+                except discord.HTTPException as error:
+                    log_http_error(f"既存チケットへの閲覧権限の追加 #{channel.name}", error)
 
 
 def is_ticket(channel):
@@ -2718,6 +2768,10 @@ async def open_ticket(interaction, order_category=None):
                         manage_channels=True,
                     )
 
+            for target in await ticket_extra_access_targets(guild):
+                if target not in overwrites:
+                    overwrites[target] = discord.PermissionOverwrite(**TICKET_EXTRA_ACCESS_PERMS)
+
             channel = await guild.create_text_channel(
                 name=f"ticket-{user.name}",
                 category=category,
@@ -2977,7 +3031,7 @@ class ClosedTicketView(discord.ui.View):
         custom_id="ticket:delete",
     )
     async def delete_ticket(self, interaction, button):
-        if not is_staff(interaction.user):
+        if not (is_staff(interaction.user) or has_ticket_extra_access(interaction.user)):
             await interaction.response.send_message(
                 "スタッフのみ操作できます。",
                 ephemeral=True,
@@ -3140,6 +3194,12 @@ async def on_ready():
     logger.info("スタッフ通知先: %s", STAFF_CHANNEL_ID or "各チケット内")
     logger.info("PayPayリンク: %s", "設定済み" if (PAYPAY_LINK or PAYPAY_LINKS) else "未設定")
     logger.info("================================")
+    if not getattr(bot, "_extra_access_granted", False):
+        bot._extra_access_granted = True
+        try:
+            await grant_extra_access_to_existing_tickets()
+        except Exception as error:
+            log_unexpected_error("既存チケットへの閲覧権限の追加", error)
 
 
 # ==========================================
