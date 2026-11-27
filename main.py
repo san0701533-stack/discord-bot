@@ -2660,21 +2660,22 @@ async def open_ticket(interaction, order_category=None):
                 log_http_error("チケット作成失敗の通知", notify_error)
 
 
-# ---- 新しいチケット作成パネル（ゴールド・メニューで種類を選ぶ） ----
+# ---- 新しいチケット作成パネル（上部に動画・メニューで種類を選ぶ） ----
 
-TICKET_BANNER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "ticket_banner.png")
-TICKET_BANNER_FILENAME = "ticket_banner.png"
-COLOR_GOLD = 0xE3A008
+# 上部の動画（RSGYの紹介動画をGIFにしたもの。GIFはDiscordで自動再生される）。黒・アイボリー・シャンパンゴールドの雰囲気に合わせる
+TICKET_BANNER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "ticket_banner.gif")
+TICKET_BANNER_FILENAME = "ticket_banner.gif"
+COLOR_CHAMPAGNE = 0xB89A6A
 
 TICKET_MENU_OPTIONS = [
-    ("boost", "代行", "⚡", "トロ上げ・ガチバ／料金は自動計算"),
-    ("cheat", "チート", "🧩", "スタッフが個別にご案内します"),
+    ("boost", "代行", "⚔️", "トロ上げ・ガチバ／料金は自動計算"),
+    ("cheat", "チート", "🗝️", "スタッフが個別にご案内します"),
     ("middle", "仲介", "🤝", f"お取引の仲介／手数料 ¥{MIDDLE_FEE:,}"),
 ]
 
 
 def ticket_banner_media():
-    """バナー画像。ORDER_BANNER_URL があればそれを、なければ同梱の画像を使う。"""
+    """上部の動画・画像。ORDER_BANNER_URL があればそれを、なければ同梱の動画を使う。"""
     if ORDER_BANNER_URL:
         return ORDER_BANNER_URL
     if os.path.exists(TICKET_BANNER_PATH):
@@ -2683,18 +2684,19 @@ def ticket_banner_media():
 
 
 def ticket_banner_files():
-    """パネルを新しく送るときに添付する画像。"""
+    """パネルを新しく送るときに添付する動画。"""
     if not ORDER_BANNER_URL and os.path.exists(TICKET_BANNER_PATH):
         return [discord.File(TICKET_BANNER_PATH, filename=TICKET_BANNER_FILENAME)]
     return []
 
 
 def build_ticket_panel_layout():
-    container = discord.ui.Container(accent_colour=COLOR_GOLD)
+    container = discord.ui.Container(accent_colour=COLOR_CHAMPAGNE)
     banner = ticket_banner_media()
     if banner:
         container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(banner)))
     container.add_item(discord.ui.TextDisplay(
+        "-# R S G Y　　/　　O R D E R　D E S K\n"
         "# ご注文受付\n"
         "下のメニューから種類を選ぶと、あなた専用のチケットが作成されます。"
     ))
@@ -2709,10 +2711,14 @@ def build_ticket_panel_layout():
     )))
     container.add_item(discord.ui.ActionRow(discord.ui.Button(
         label="料金表",
-        emoji="📋",
+        emoji="📜",
         style=discord.ButtonStyle.secondary,
         custom_id="tp:prices",
     )))
+    container.add_item(discord.ui.Separator(visible=False))
+    container.add_item(discord.ui.TextDisplay(
+        "-# ✦　メニューは使うたびに元に戻ります　·　お支払いは PayPay / LTC"
+    ))
     view = discord.ui.LayoutView(timeout=None)
     view.add_item(container)
     return view
@@ -3038,7 +3044,7 @@ async def setup_ticket(ctx):
     if not is_command_owner(ctx.author):
         return
 
-    # ゴールドのバナー＋メニューで種類を選ぶパネル（以前に出したボタンのパネルも引き続き動く）
+    # 上部に動画、メニューで種類を選ぶパネル（以前に出したボタンのパネルも引き続き動く）
     await ctx.send(view=build_ticket_panel_layout(), files=ticket_banner_files())
 
 
