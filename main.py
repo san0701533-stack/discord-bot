@@ -1019,7 +1019,7 @@ ORDER_FOOTER_RE = re.compile(r"ORDER #([0-9A-F]{4,16})")
 # 画面右上のRSGYロゴ。環境変数で差し替えられる
 RSGY_LOGO_URL = os.getenv(
     "RSGY_LOGO_URL",
-    "https://raw.githubusercontent.com/san0701533-stack/discord-bot/main/assets/rsgy_logo.jpg",
+    "https://raw.githubusercontent.com/san0701533-stack/discord-bot/main/assets/rsgy_logo.jpg?v=2",
 ).strip()
 COLOR_CHAMPAGNE = 0xB89A6A
 ORDER_KEEP_DAYS = 90
@@ -1292,7 +1292,7 @@ def render_step(state, step, ret="n"):
             "◆ **プレイヤータグ**（必須）　例：`#ABC123`",
             "◆ **対象キャラ**（任意）",
             "◆ **備考**（任意）　希望納期など",
-            "-# 🔐 パスワードや認証コードは入力しないでください",
+            "-# 🔐 パスワードは入力しないでください（ログインに必要な情報は、お支払い後にご案内します）",
         ]
         if answers.get("tag"):
             lines.append(f"\n入力済み：**{answers['tag']}**　/　{answers.get('brawler') or 'なし'}　/　{answers.get('note') or 'なし'}")
@@ -1448,7 +1448,8 @@ def render_status(state):
                 "**🪙 LTC（仮想通貨）**\n-# 送金先アドレスを表示します",
                 accessory=_btn("LTCで支払う", "ord:pay:ltc"),
             ))
-        items += [_sep(), _text("-# リンクはチャットに貼らず、必ずフォームから送ってください"), _footer(state)]
+        items += [_sep(), _text("-# リンクはチャットに貼らず、必ずフォームから送ってください"),
+                  *_staff_controls(state), _footer(state)]
         return _layout(*items, outside=f"{owner} お支払いのご案内です。")
 
     if status == "submitted" and has_payment_flow:
@@ -1471,7 +1472,7 @@ def render_status(state):
             ))
             items.append(_row(_btn("PayPayリンクを入力・送信", "ord:p:paypay_open",
                                    style=discord.ButtonStyle.primary, emoji="💳")))
-        items.append(_footer(state))
+        items += [*_staff_controls(state), _footer(state)]
         return _layout(*items)
 
     if status == "submitted":  # 支払い方法がない旧形式のチート相談
@@ -1493,6 +1494,7 @@ def render_status(state):
             _sep(),
             _text(_timeline(state)),
             _text("-# ご不明な点は、このチャンネルにそのまま書き込んでください"),
+            *_staff_controls(state),
             _footer(state),
         )
 
@@ -1536,6 +1538,103 @@ def render_status(state):
         _row(_btn("最初からやり直す", "ord:restart", style=discord.ButtonStyle.primary, emoji="🔄")),
         _footer(state),
     )
+
+
+def _staff_controls(state):
+    """スタッフだけが押せるボタン（お客様が押しても動かない）。"""
+    status = state["status"]
+    buttons = []
+    if status == "reported":
+        buttons.append(_btn("入金を確認", "ord:sp:confirm", style=discord.ButtonStyle.success, emoji="✅"))
+    elif status == "received":
+        buttons.append(_btn("対応を開始", "ord:sp:confirm", style=discord.ButtonStyle.success, emoji="✅"))
+    elif status == "paid":
+        buttons.append(_btn("完了", "ord:sp:done", style=discord.ButtonStyle.success, emoji="🏁"))
+    buttons.append(_btn("注文取消", "ord:sp:cancel", emoji="✖️"))
+    return [_sep(), _text("-# スタッフ用"), _row(*buttons)]
+
+
+def render_account_request(state):
+    """代行の対応開始時に、ログインに必要なメールアドレスと認証コードをお願いする画面。"""
+    email = state.get("meta", {}).get("email")
+    lines = [
+        "## ログイン情報のご案内",
+        "メールアドレスを入力してください。\n"
+        "スタッフがメールアドレスを入力したら認証コードが届くので、それを教えてください。",
+    ]
+    items = [_head(_kicker(state), *lines), _sep()]
+    if email:
+        items.append(_text(f"📧 受け付けたメールアドレス：`{email}`\n-# 認証コードが届いたら、下のボタンから入力してください"))
+    items.append(_row(
+        _btn("メールアドレスを変更" if email else "メールアドレスを入力", "ord:acct:email",
+             style=discord.ButtonStyle.secondary if email else discord.ButtonStyle.primary, emoji="📧"),
+        _btn("認証コードを入力", "ord:acct:code",
+             style=discord.ButtonStyle.primary if email else discord.ButtonStyle.secondary, emoji="🔑",
+             disabled=not email),
+    ))
+    items.append(_text("-# 🔐 パスワードは聞きません　·　認証コードは届いたらすぐに入力してください"))
+    items.append(_footer(state))
+    return _layout(*items, outside=f"<@{state['owner_id']}>")
+
+
+def build_account_modal(kind):
+    if kind == "email":
+        modal = discord.ui.Modal(title="メールアドレスの入力", custom_id="ord:acctm:email", timeout=600)
+        modal.add_item(discord.ui.TextInput(
+            label="メールアドレス", custom_id="email", placeholder="例：example@gmail.com",
+            required=True, max_length=254,
+        ))
+    else:
+        modal = discord.ui.Modal(title="認証コードの入力", custom_id="ord:acctm:code", timeout=600)
+        modal.add_item(discord.ui.TextInput(
+            label="認証コード", custom_id="code", placeholder="届いたコードをそのまま入力",
+            required=True, max_length=12,
+        ))
+    return modal
+
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+async def handle_account_action(interaction, state, kind, submitted):
+    """ログイン情報（メールアドレス・認証コード）の受け付け。"""
+    if state["answers"].get("category") != "boost" or state["status"] != "paid":
+        return await _ephemeral(interaction, "現在、ログイン情報の入力は受け付けていません。")
+    if kind == "code" and not state.get("meta", {}).get("email"):
+        return await _ephemeral(interaction, "先にメールアドレスを入力してください。")
+    if not submitted:
+        await interaction.response.send_modal(build_account_modal(kind))
+        return
+    values = modal_values(interaction.data)
+    channel = interaction.channel
+    mentions = staff_mentions(channel.guild)
+    if kind == "email":
+        email = unicodedata.normalize("NFKC", values.get("email") or "").strip()
+        if not EMAIL_RE.match(email):
+            return await _ephemeral(interaction, "メールアドレスの形式が正しくありません。もう一度入力してください。")
+        state.setdefault("meta", {})["email"] = email
+        entry = load_order(state["order_id"])
+        if entry:
+            save_order(state, entry["channel_id"], entry["message_id"])
+        await interaction.response.edit_message(view=render_account_request(state), allowed_mentions=PANEL_MENTIONS)
+        await safe_send(
+            channel,
+            f"📧 **メールアドレスを受け付けました**　`{email}`\n"
+            f"スタッフはログインを進めてください。認証コードが届いたら、お客様に入力していただきます。{mentions}",
+            allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+        )
+        logger.info("メールアドレスを受付: #%s", state["order_id"])
+        return
+    code = re.sub(r"\s", "", unicodedata.normalize("NFKC", values.get("code") or ""))
+    if not re.fullmatch(r"[A-Za-z0-9-]{4,12}", code):
+        return await _ephemeral(interaction, "認証コードの形式が正しくありません。届いたコードをそのまま入力してください。")
+    await interaction.response.send_message("認証コードをスタッフに伝えました。ありがとうございます。", ephemeral=True)
+    await safe_send(
+        channel,
+        f"🔑 **認証コードが届きました**　`{code}`　{mentions}",
+        allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+    )
+    logger.info("認証コードを受付: #%s", state["order_id"])
 
 
 def render_cancel_confirm(state, back_to):
@@ -1866,18 +1965,15 @@ def staff_view(state, channel_id, message_id):
 
 
 async def notify_staff(guild, ticket_channel, panel_message, state, title):
+    """スタッフへ一行だけ知らせる（操作は進み具合の画面のスタッフ用ボタンで行う）。"""
     target = guild.get_channel(STAFF_CHANNEL_ID) if (guild and STAFF_CHANNEL_ID) else None
     if target is None:
         target = ticket_channel
-
-    embed = build_staff_embed(state, ticket_channel, title, panel_message.jump_url)
-    view = staff_view(state, ticket_channel.id, panel_message.id)
-    mentions = staff_mentions(guild)
+    link = f"　[▸ 画面を開く]({panel_message.jump_url})" if target is not ticket_channel else ""
     await safe_send(
         target,
-        f"⚠️ **スタッフの対応をお願いします。** {mentions}".strip(),
-        embed=embed,
-        view=view,
+        f"{title}　{staff_mentions(guild)}".strip() + link,
+        allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
     )
 
 
@@ -1962,6 +2058,8 @@ async def handle_customer_action(interaction, parts):
         return
 
     action = parts[1]
+    if action in ("acct", "acctm"):     # ログイン情報の入力（代行の対応中）
+        return await handle_account_action(interaction, state, parts[2] if len(parts) > 2 else "", action == "acctm")
     is_review = action in ("open", "modal") and len(parts) > 2 and parts[2] == "review"
 
     if not is_review and _ticket_closed_for(channel, owner_id):
@@ -2296,13 +2394,10 @@ async def add_middle_partner(channel, panel, state, partner_id):
             f"⚠️ 取引相手 {partner.mention} をチケットに追加できませんでした。{staff_mentions(channel.guild)}",
         )
         return
-    staff_embed = build_staff_embed(state, channel, "🤝 仲介の取引が始まりました", panel.jump_url)
     await safe_send(
         channel,
         f"🤝 取引相手 {partner.mention} をこのチケットに追加しました。\n"
         f"スタッフの対応をお待ちください。{staff_mentions(channel.guild)}",
-        embed=staff_embed,
-        view=staff_view(state, channel.id, panel.id),
     )
     logger.info("仲介の取引相手を追加: #%s partner=%s", state["order_id"], partner.id)
 
@@ -2560,10 +2655,9 @@ async def handle_customer_paypay_action(interaction, parts):
                     or state["answers"].get("payment") != "paypay"):
                 return await _ephemeral(interaction, "現在の状態では受け取り確認できません。")
 
-            # 段階3：受け取り確認済みへ
-            state["status"] = "received"
+            # 段階3：受け取りを確認したら、そのまま「対応中」へ進める
             try:
-                panel = await edit_panel(panel, state)
+                panel = await apply_status_change(channel, panel, state, "paid")
             except discord.HTTPException as error:
                 log_http_error("PayPay受け取り確認の反映", error)
                 return await _ephemeral(interaction, "チケットの更新に失敗しました。もう一度ボタンを押してください。")
@@ -2571,26 +2665,12 @@ async def handle_customer_paypay_action(interaction, parts):
             paypay_confirmed_panels.add((message_id, state["order_id"]))
             logger.info("PayPay受け取り確認: #%s by %s", state["order_id"], interaction.user.id)
 
-            # ボタン押下後にのみ、チケット内でスタッフへメンション
-            # （仲介はリンク送信時にメンション済みのため、ここではメンションしない）
-            is_middle = state["answers"].get("category") == "middle"
-            mentions = "" if is_middle else staff_mentions(channel.guild)
-            staff_embed = build_staff_embed(
-                state, channel, "✅ PayPay受け取り確認済み", panel.jump_url, interaction.user,
-            )
-            await safe_send(
-                channel,
-                f"✅ **PayPayの受け取りが確認されました。対応をお願いします。** {mentions}".strip(),
-                embed=staff_embed,
-                view=staff_view(state, channel.id, panel.id),
-            )
-
             if state["answers"].get("category") == "boost" and interaction.user.id == PAYPAY_BOOST_USER_ID:
                 await notify_boost_share(state)
 
             await interaction.edit_original_response(view=_paypay_dm_view(0, 0, confirmed=True))
 
-        return await _ephemeral(interaction, "受け取り確認を記録し、スタッフへ通知しました。")
+        return await _ephemeral(interaction, "受け取りを確認し、チケットを「対応中」に進めました。")
 
     # ---- 通知先DM：「リンクを表示」ボタン ----
     if action == "pv":
@@ -2656,6 +2736,56 @@ async def handle_customer_paypay_action(interaction, parts):
     return await _ephemeral(interaction, "不明な操作です。")
 
 
+async def apply_status_change(channel, panel, state, new_status):
+    """注文の状態を進め、画面とお知らせを更新する。更新後の画面（メッセージ）を返す。"""
+    state["status"] = new_status
+    owner = f"<@{state['owner_id']}>" if state.get("owner_id") else ""
+    is_boost = state["answers"].get("category") == "boost"
+    if new_status == "done":
+        # 進み具合の画面を消して、完了の画面を出す（実績へのコメント待ちを始める）
+        now = time.time()
+        state.setdefault("meta", {})["done_at"] = now
+        state["meta"]["review"] = {"status": "pending", "last_remind": now}
+        return await repost_panel(channel, panel, state)
+
+    panel = await edit_panel(panel, state)
+    if new_status == "paid":
+        if is_boost:
+            # 代行はログインに必要なメールアドレスと認証コードをお願いする
+            await channel.send(view=render_account_request(state), allowed_mentions=PANEL_MENTIONS)
+        else:
+            await safe_send(channel, f"{owner} 入金を確認しました。対応を開始します！")
+            await notify_staff(channel.guild, channel, panel, state, "✅ 入金を確認しました。対応をお願いします。")
+    elif new_status == "cancelled":
+        await safe_send(channel, f"{owner} ご注文 `#{state['order_id']}` はスタッフによりキャンセルされました。")
+    return panel
+
+
+async def handle_panel_staff_action(interaction, action):
+    """進み具合の画面にある、スタッフ用ボタン（ord:sp:<action>）。"""
+    if not is_staff(interaction.user):
+        return await _ephemeral(interaction, "スタッフのみ操作できます。")
+    channel = interaction.channel
+    panel = await channel.fetch_message(interaction.message.id)
+    state = parse_order_message(panel)
+    if state is None:
+        return await _ephemeral(interaction, "受付データを読み込めませんでした。")
+    transitions = {
+        "confirm": ({"reported", "received"}, "paid"),
+        "done": ({"paid"}, "done"),
+        "cancel": ({"payment_select", "submitted", "link_sent", "received", "reported", "paid"}, "cancelled"),
+    }
+    if action not in transitions:
+        return await _ephemeral(interaction, "不明な操作です。")
+    allowed, new_status = transitions[action]
+    if state["status"] not in allowed:
+        return await _ephemeral(interaction, f"現在の状態（{STATUS_TEXT[state['status']]}）ではこの操作はできません。")
+    await interaction.response.defer()
+    if await apply_status_change(channel, panel, state, new_status) is None:
+        return await _ephemeral(interaction, "画面を更新できませんでした。もう一度お試しください。")
+    logger.info("注文 #%s を %s に変更 (staff=%s)", state["order_id"], new_status, interaction.user.id)
+
+
 async def handle_staff_action(interaction, parts):
     # ord:s:<action>:<channel_id>:<message_id>
     if not is_staff(interaction.user):
@@ -2712,34 +2842,11 @@ async def handle_staff_action(interaction, parts):
                 f"現在の状態（{STATUS_TEXT[state['status']]}）ではこの操作はできません。",
             )
         else:
-            state["status"] = new_status
-            if new_status == "done":
-                # 進み具合の画面を消して、完了の画面を出す（実績へのコメント待ちを始める）
-                now = time.time()
-                state.setdefault("meta", {})["done_at"] = now
-                state["meta"]["review"] = {"status": "pending", "last_remind": now}
-                new_panel = await repost_panel(channel, panel, state)
-                if new_panel is None:
-                    await _ephemeral(interaction, "完了画面を出せませんでした。もう一度お試しください。")
-                    return
-                panel = new_panel
-            else:
-                panel = await edit_panel(panel, state)
-
-            owner = f"<@{state['owner_id']}>" if state.get("owner_id") else ""
-            is_cheat = state["answers"].get("category") == "cheat"
-            notices = {
-                "paid": (
-                    f"{owner} スタッフが対応を開始しました。"
-                    if is_cheat and not state["answers"].get("payment") else
-                    f"{owner} 入金を確認しました。対応を開始します！"
-                    if is_cheat else
-                    f"{owner} 入金を確認しました。代行を開始します！"
-                ),
-                "cancelled": f"{owner} ご注文 `#{state['order_id']}` はスタッフによりキャンセルされました。",
-            }
-            if new_status in notices:  # 完了は完了画面でお知らせする
-                await safe_send(channel, notices[new_status])
+            new_panel = await apply_status_change(channel, panel, state, new_status)
+            if new_panel is None:
+                await _ephemeral(interaction, "画面を更新できませんでした。もう一度お試しください。")
+                return
+            panel = new_panel
             logger.info(
                 "注文 #%s を %s に変更 (staff=%s)",
                 state["order_id"], new_status, interaction.user.id,
@@ -2774,6 +2881,10 @@ async def on_order_interaction(interaction):
             return
         if parts[1] == "delete":
             await handle_order_delete(interaction)
+            return
+        if parts[1] == "sp":
+            async with order_locks[interaction.message.id]:
+                await handle_panel_staff_action(interaction, parts[2] if len(parts) > 2 else "")
             return
 
         lock_key = interaction.message.id if interaction.message else interaction.channel_id
