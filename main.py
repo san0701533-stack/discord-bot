@@ -159,7 +159,7 @@ STAFF_ROLES = [
 TICKET_CATEGORY = "チケット"
 
 # スタッフと同じ扱いにする追加のユーザー・ロール（どちらのIDでもよい）
-# チケットの閲覧・書き込み・閉じる/再開/削除・注文の状態変更ができ、スタッフ通知でもメンションされる
+# チケットの閲覧・書き込み・閉じる/再開/削除・注文の状態変更ができる（スタッフ通知のメンションには入れない）
 TICKET_EXTRA_ACCESS_IDS = [
     1571087140886937672,
 ]
@@ -436,9 +436,6 @@ def staff_mentions(guild):
         role = guild.get_role(role_id)
         if role:
             mentions.append(role.mention)
-    for target_id in TICKET_EXTRA_ACCESS_IDS:
-        role = guild.get_role(target_id)
-        mentions.append(role.mention if role else f"<@{target_id}>")
     return " ".join(mentions)
 
 
