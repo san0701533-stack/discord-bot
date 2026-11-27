@@ -1745,8 +1745,10 @@ async def notify_staff(guild, ticket_channel, panel_message, state, title):
     )
 
 
-async def send_order_panel(channel, owner_id):
+async def send_order_panel(channel, owner_id, category=None):
     state = new_order_state(owner_id)
+    if category in CATEGORY_LABELS:
+        apply_answer(state, "category", category)
     embed, view = render_panel(state)
     return await safe_send(channel, None, embed=embed, view=view)
 
@@ -2537,108 +2539,222 @@ class TicketPanel(discord.ui.View):
         custom_id="ticket:create",
     )
     async def create_ticket(self, interaction, button):
-        guild = interaction.guild
-        user = interaction.user
+        await open_ticket(interaction)
 
-        if guild is None:
-            await interaction.response.send_message(
-                "サーバー内で使用してください。",
-                ephemeral=True,
-            )
-            return
 
-        # チャンネル作成は3秒の応答期限を超えることがあるため、先に本人だけに「考え中…」を出す。
-        # 期限切れで応答に失敗すると、ウェルカムメッセージ・受付パネルが送られないチケットが残る。
-        await interaction.response.defer(ephemeral=True, thinking=True)
+async def open_ticket(interaction, order_category=None):
+    """チケットを作成する（旧パネルのボタン・新パネルのメニュー共通）。
 
-        async with ticket_create_locks[(guild.id, user.id)]:
-            for channel in guild.text_channels:
-                if is_ticket(channel) and get_ticket_owner(channel) == user.id:
-                    await interaction.followup.send(
-                        f"すでにチケットがあります：{channel.mention}",
-                        ephemeral=True,
-                    )
-                    return
+    order_category を指定すると、受付パネルは「ご依頼の種類」を選んだ状態から始まる。
+    """
+    guild = interaction.guild
+    user = interaction.user
 
-            notified = False
-            try:
-                category = discord.utils.get(guild.categories, name=TICKET_CATEGORY)
-                if category is None:
-                    category = await guild.create_category(TICKET_CATEGORY)
+    if guild is None:
+        await interaction.response.send_message(
+            "サーバー内で使用してください。",
+            ephemeral=True,
+        )
+        return
 
-                overwrites = {
-                    guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                    user: discord.PermissionOverwrite(
-                        view_channel=True,
-                        send_messages=True,
-                        read_message_history=True,
-                        attach_files=True,
-                    ),
-                    guild.me: discord.PermissionOverwrite(
+    # チャンネル作成は3秒の応答期限を超えることがあるため、先に本人だけに「考え中…」を出す。
+    # 期限切れで応答に失敗すると、ウェルカムメッセージ・受付パネルが送られないチケットが残る。
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    async with ticket_create_locks[(guild.id, user.id)]:
+        for channel in guild.text_channels:
+            if is_ticket(channel) and get_ticket_owner(channel) == user.id:
+                await interaction.followup.send(
+                    f"すでにチケットがあります：{channel.mention}",
+                    ephemeral=True,
+                )
+                return
+
+        notified = False
+        try:
+            category = discord.utils.get(guild.categories, name=TICKET_CATEGORY)
+            if category is None:
+                category = await guild.create_category(TICKET_CATEGORY)
+
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                user: discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    attach_files=True,
+                ),
+                guild.me: discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    manage_channels=True,
+                ),
+            }
+
+            for role_id in STAFF_ROLES:
+                role = guild.get_role(role_id)
+                if role:
+                    overwrites[role] = discord.PermissionOverwrite(
                         view_channel=True,
                         send_messages=True,
                         read_message_history=True,
                         manage_channels=True,
-                    ),
-                }
-
-                for role_id in STAFF_ROLES:
-                    role = guild.get_role(role_id)
-                    if role:
-                        overwrites[role] = discord.PermissionOverwrite(
-                            view_channel=True,
-                            send_messages=True,
-                            read_message_history=True,
-                            manage_channels=True,
-                        )
-
-                channel = await guild.create_text_channel(
-                    name=f"ticket-{user.name}",
-                    category=category,
-                    overwrites=overwrites,
-                    topic=f"ticket_owner:{user.id}",
-                )
-
-                notified = True
-                try:
-                    await interaction.followup.send(
-                        f"チケットを作成しました：{channel.mention}",
-                        ephemeral=True,
                     )
-                except discord.HTTPException as error:
-                    # 通知に失敗してもチケットの初期化（ウェルカム・受付パネル）は続ける
-                    log_http_error("チケット作成の完了通知", error)
 
-                welcome = discord.Embed(
-                    title="お問い合わせありがとうございます",
-                    description=(
-                        "下の **受付パネル** のボタンを順番に選ぶだけで、ご注文が完了します。\n"
-                        "料金は料金表に基づいて自動で計算されます。\n\n"
-                        "◆ 内容の変更・戻る・キャンセルはいつでも可能です\n"
-                        "◆ パネルはご本人様のみ操作できます\n"
-                        "◆ 料金表にないご相談はスタッフが個別に対応します"
-                    ),
-                    color=COLOR_DEEP,
-                )
-                welcome.set_author(name=f"◆ {BRAND_NAME}　｜　SUPPORT")
-                await channel.send(
-                    f"{user.mention}",
-                    embed=welcome,
-                    view=OpenTicketView(),
-                )
-                await send_order_panel(channel, user.id)
+            channel = await guild.create_text_channel(
+                name=f"ticket-{user.name}",
+                category=category,
+                overwrites=overwrites,
+                topic=f"ticket_owner:{user.id}",
+            )
 
+            notified = True
+            try:
+                await interaction.followup.send(
+                    f"チケットを作成しました：{channel.mention}",
+                    ephemeral=True,
+                )
             except discord.HTTPException as error:
-                log_http_error("チケット作成", error)
-                if notified:
-                    return  # 作成完了は通知済み（従来どおり失敗通知は重ねて出さない）
-                try:
-                    await interaction.followup.send(
-                        "チケットの作成に失敗しました。スタッフに確認してください。",
-                        ephemeral=True,
-                    )
-                except discord.HTTPException as notify_error:
-                    log_http_error("チケット作成失敗の通知", notify_error)
+                # 通知に失敗してもチケットの初期化（ウェルカム・受付パネル）は続ける
+                log_http_error("チケット作成の完了通知", error)
+
+            welcome = discord.Embed(
+                title="お問い合わせありがとうございます",
+                description=(
+                    "下の **受付パネル** のボタンを順番に選ぶだけで、ご注文が完了します。\n"
+                    "料金は料金表に基づいて自動で計算されます。\n\n"
+                    "◆ 内容の変更・戻る・キャンセルはいつでも可能です\n"
+                    "◆ パネルはご本人様のみ操作できます\n"
+                    "◆ 料金表にないご相談はスタッフが個別に対応します"
+                ),
+                color=COLOR_DEEP,
+            )
+            welcome.set_author(name=f"◆ {BRAND_NAME}　｜　SUPPORT")
+            await channel.send(
+                f"{user.mention}",
+                embed=welcome,
+                view=OpenTicketView(),
+            )
+            await send_order_panel(channel, user.id, order_category)
+
+        except discord.HTTPException as error:
+            log_http_error("チケット作成", error)
+            if notified:
+                return  # 作成完了は通知済み（従来どおり失敗通知は重ねて出さない）
+            try:
+                await interaction.followup.send(
+                    "チケットの作成に失敗しました。スタッフに確認してください。",
+                    ephemeral=True,
+                )
+            except discord.HTTPException as notify_error:
+                log_http_error("チケット作成失敗の通知", notify_error)
+
+
+# ---- 新しいチケット作成パネル（ゴールド・メニューで種類を選ぶ） ----
+
+TICKET_BANNER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "ticket_banner.png")
+TICKET_BANNER_FILENAME = "ticket_banner.png"
+COLOR_GOLD = 0xE3A008
+
+TICKET_MENU_OPTIONS = [
+    ("boost", "代行", "⚡", "トロ上げ・ガチバ／料金は自動計算"),
+    ("cheat", "チート", "🧩", "スタッフが個別にご案内します"),
+    ("middle", "仲介", "🤝", f"お取引の仲介／手数料 ¥{MIDDLE_FEE:,}"),
+]
+
+
+def ticket_banner_media():
+    """バナー画像。ORDER_BANNER_URL があればそれを、なければ同梱の画像を使う。"""
+    if ORDER_BANNER_URL:
+        return ORDER_BANNER_URL
+    if os.path.exists(TICKET_BANNER_PATH):
+        return f"attachment://{TICKET_BANNER_FILENAME}"
+    return None
+
+
+def ticket_banner_files():
+    """パネルを新しく送るときに添付する画像。"""
+    if not ORDER_BANNER_URL and os.path.exists(TICKET_BANNER_PATH):
+        return [discord.File(TICKET_BANNER_PATH, filename=TICKET_BANNER_FILENAME)]
+    return []
+
+
+def build_ticket_panel_layout():
+    container = discord.ui.Container(accent_colour=COLOR_GOLD)
+    banner = ticket_banner_media()
+    if banner:
+        container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(banner)))
+    container.add_item(discord.ui.TextDisplay(
+        "# ご注文受付\n"
+        "下のメニューから種類を選ぶと、あなた専用のチケットが作成されます。"
+    ))
+    container.add_item(discord.ui.Separator())
+    container.add_item(discord.ui.ActionRow(discord.ui.Select(
+        custom_id="tp:menu",
+        placeholder="ご依頼の種類を選択",
+        options=[
+            discord.SelectOption(label=label, value=value, emoji=emoji, description=desc)
+            for value, label, emoji, desc in TICKET_MENU_OPTIONS
+        ],
+    )))
+    container.add_item(discord.ui.ActionRow(discord.ui.Button(
+        label="料金表",
+        emoji="📋",
+        style=discord.ButtonStyle.secondary,
+        custom_id="tp:prices",
+    )))
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    return view
+
+
+def price_table_text():
+    lines = ["## 📋 料金表", "### 🏆 トロ上げ代行"]
+    for (start, goal), price in sorted(TROPHY_PRICES.items()):
+        lines.append(f"・{start:,} → {goal:,} トロ　**¥{price:,}**")
+    lines.append("### ⚔️ ガチバ代行")
+    for (start, goal), price in sorted(RANK_PRICES.items()):
+        lines.append(f"・{RANK_NAMES[start]} → {RANK_NAMES[goal]}　**¥{price:,}**")
+    lines += [
+        "-# 表にない区間は、つながる区間を合計して自動で計算します（マスター帯以降は除く）。",
+        "### 🧩 チート",
+        "・スタッフが個別にご案内します",
+        "### 🤝 仲介",
+        f"・手数料　**¥{MIDDLE_FEE:,}**",
+    ]
+    return "\n".join(lines)
+
+
+@bot.listen("on_interaction")
+async def on_ticket_panel_interaction(interaction):
+    if interaction.type != discord.InteractionType.component:
+        return
+    custom_id = (interaction.data or {}).get("custom_id", "")
+    if not custom_id.startswith("tp:"):
+        return
+    try:
+        if custom_id == "tp:prices":
+            await interaction.response.send_message(price_table_text(), ephemeral=True)
+            return
+        if custom_id == "tp:menu":
+            values = (interaction.data or {}).get("values") or []
+            order_category = values[0] if values else None
+            if order_category not in CATEGORY_LABELS:
+                await _ephemeral(interaction, "不正な選択です。")
+                return
+            await open_ticket(interaction, order_category)
+            # 選んだ項目が残らないよう、メニューを元に戻す（失敗してもチケット作成には影響しない）
+            try:
+                await interaction.message.edit(view=build_ticket_panel_layout())
+            except discord.HTTPException as error:
+                log_http_error("チケット作成メニューのリセット", error)
+    except discord.HTTPException as error:
+        log_http_error("チケット作成パネルの操作", error)
+        await _ephemeral(interaction, "通信エラーが発生しました。もう一度お試しください。")
+    except Exception as error:
+        log_unexpected_error("チケット作成パネルの操作", error)
+        await _ephemeral(interaction, "エラーが発生しました。スタッフにお問い合わせください。")
 
 
 # ==========================================
@@ -2913,24 +3029,8 @@ async def setup_ticket(ctx):
     if not is_staff(ctx.author):
         return
 
-    embed = discord.Embed(
-        title="お問い合わせ・ご注文",
-        description=(
-            "下のボタンを押すと、あなた専用のチケットが作成されます。\n"
-            f"{DIVIDER}\n"
-            "⚡ **代行**　─　トロ上げ / ガチバトル（料金自動計算）\n"
-            "🧩 **チート**　─　スタッフが個別にご案内\n"
-            f"🤝 **仲介**　─　お取引の仲介（手数料 ¥{MIDDLE_FEE:,}）\n"
-            f"{DIVIDER}\n"
-            "ボタンを選ぶだけで、ご注文からお支払いまで完結します。"
-        ),
-        color=COLOR_MAIN,
-    )
-    embed.set_author(name=f"◆ {BRAND_NAME}")
-    if ORDER_BANNER_URL:
-        embed.set_image(url=ORDER_BANNER_URL)
-
-    await ctx.send(embed=embed, view=TicketPanel())
+    # ゴールドのバナー＋メニューで種類を選ぶパネル（以前に出したボタンのパネルも引き続き動く）
+    await ctx.send(view=build_ticket_panel_layout(), files=ticket_banner_files())
 
 
 @bot.command()
