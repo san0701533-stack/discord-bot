@@ -2063,6 +2063,51 @@ def _paypay_dm_view(channel_id, message_id, *, confirmed=False, label=None, orde
     )])
 
 
+def _paypay_reveal_view(channel_id, message_id, order_id):
+    """通知先DMの「リンクを表示」ボタン。"""
+    return _view([_button(
+        "リンクを表示",
+        f"ord:p:pv:{channel_id}:{message_id}:{order_id}",
+        style=discord.ButtonStyle.primary,
+        emoji="🔗", row=0,
+    )])
+
+
+def _paypay_owner_view(channel_id, message_id, order_id, *, held=False):
+    """リンク表示後の「受け取りました」「保留」ボタン。"""
+    return _view([
+        _button(
+            "受け取りました",
+            f"ord:p:paypay_recv:{channel_id}:{message_id}:{order_id}",
+            style=discord.ButtonStyle.success,
+            emoji="✅", row=0,
+        ),
+        _button(
+            "保留を通知済み" if held else "保留",
+            f"ord:p:paypay_hold:{channel_id}:{message_id}:{order_id}",
+            style=discord.ButtonStyle.secondary,
+            emoji="⏸️", row=0,
+            disabled=held,
+        ),
+    ])
+
+
+async def find_sent_paypay_link(channel_id, order_id):
+    """代行の受け取り先へ送ったDMから、その注文のPayPayリンクを探す。"""
+    recipient = bot.get_user(PAYPAY_BOOST_USER_ID) or await bot.fetch_user(PAYPAY_BOOST_USER_ID)
+    dm = recipient.dm_channel or await recipient.create_dm()
+    async for message in dm.history(limit=300):
+        if message.author.id != bot.user.id:
+            continue
+        content = message.content or ""
+        if f"注文ID：#{order_id}" not in content or f"<#{channel_id}>" not in content:
+            continue
+        match = PAYPAY_URL_RE.search(content)
+        if match:
+            return match.group(0)
+    return None
+
+
 async def _fetch_ticket_panel(channel_id, message_id):
     channel = bot.get_channel(channel_id)
     if channel is None:
@@ -2280,7 +2325,7 @@ async def handle_customer_paypay_action(interaction, parts):
             recipient_id = sent_to[0]
 
             # 代行のリンクを受け取り先へ送ったことを、通知先ユーザーへDMで知らせる
-            # （リンク自体は含めない。失敗しても注文の進行は止めない）
+            # （リンクは「リンクを表示」ボタンを押したときだけ出す。失敗しても注文の進行は止めない）
             if (state["answers"].get("category") == "boost"
                     and recipient_id == PAYPAY_BOOST_USER_ID
                     and PAYPAY_NOTIFY_USER_ID != recipient_id):
@@ -2300,6 +2345,7 @@ async def handle_customer_paypay_action(interaction, parts):
                         notify_user = await bot.fetch_user(PAYPAY_NOTIFY_USER_ID)
                     await notify_user.send(
                         notify_text,
+                        view=_paypay_reveal_view(channel.id, panel.id, state["order_id"]),
                         allowed_mentions=discord.AllowedMentions(users=True),
                     )
                 except discord.HTTPException as error:
@@ -2406,6 +2452,67 @@ async def handle_customer_paypay_action(interaction, parts):
             await interaction.edit_original_response(view=_paypay_dm_view(0, 0, confirmed=True))
 
         return await _ephemeral(interaction, "受け取り確認を記録し、スタッフへ通知しました。")
+
+    # ---- 通知先DM：「リンクを表示」ボタン ----
+    if action == "pv":
+        if interaction.user.id != PAYPAY_NOTIFY_USER_ID:
+            return await _ephemeral(interaction, "このボタンは操作できません。")
+        try:
+            channel_id, message_id, order_id = int(parts[3]), int(parts[4]), parts[5]
+        except (IndexError, ValueError):
+            return await _ephemeral(interaction, "注文情報を読み込めませんでした。")
+        await interaction.response.defer()
+        try:
+            link = await find_sent_paypay_link(channel_id, order_id)
+        except discord.HTTPException as error:
+            log_http_error("送信済みPayPayリンクの取得", error)
+            link = None
+        if link is None:
+            return await _ephemeral(interaction, "送信したPayPayリンクが見つかりませんでした。")
+        content = (interaction.message.content or "") + f"\n\n🔗 **リンク**：{link}"
+        await interaction.edit_original_response(
+            content=content,
+            view=_paypay_owner_view(channel_id, message_id, order_id),
+        )
+        return
+
+    # ---- 通知先DM：「保留」ボタン ----
+    if action == "paypay_hold":
+        if interaction.user.id != PAYPAY_NOTIFY_USER_ID:
+            return await _ephemeral(interaction, "このボタンは操作できません。")
+        try:
+            channel_id, message_id, order_id = int(parts[3]), int(parts[4]), parts[5]
+        except (IndexError, ValueError):
+            return await _ephemeral(interaction, "注文情報を読み込めませんでした。")
+        await interaction.response.defer()
+        try:
+            channel, panel = await _fetch_ticket_panel(channel_id, message_id)
+        except discord.HTTPException as error:
+            log_http_error("PayPay保留：チケット取得", error)
+            channel, panel = None, None
+        state = parse_order_message(panel) if panel is not None else None
+        if state is None:
+            return await _ephemeral(interaction, "対象のチケットまたはお支払い画面が見つかりません。")
+        if state["order_id"] != order_id:
+            return await _ephemeral(interaction, "このDMの注文は、現在のお支払い画面の注文と一致しません。")
+        if state["status"] not in ("link_sent", "submitted"):
+            return await _ephemeral(
+                interaction,
+                f"現在の状態（{STATUS_TEXT[state['status']]}）では保留の通知はできません。",
+            )
+        sent = await safe_send(
+            channel,
+            f"<@{state['owner_id']}>\n"
+            "⏸️ 送っていただいたPayPayリンクが保留になったので、承認をしてください。",
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
+        if sent is None:
+            return await _ephemeral(interaction, "チケットへの送信に失敗しました。もう一度お試しください。")
+        logger.info("PayPay保留を通知: #%s", order_id)
+        await interaction.edit_original_response(
+            view=_paypay_owner_view(channel_id, message_id, order_id, held=True),
+        )
+        return await _ephemeral(interaction, "チケットでお客様に保留を通知しました。")
 
     return await _ephemeral(interaction, "不明な操作です。")
 
