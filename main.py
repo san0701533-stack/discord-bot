@@ -2,9 +2,12 @@ import os
 import re
 import sys
 import asyncio
+import copy
+import json
 import logging
 import secrets
 import threading
+import time
 import traceback
 import unicodedata
 from collections import defaultdict
@@ -211,6 +214,12 @@ SILENT_TICKET_HOURS = 24                      # この時間注文がなけれ�
 SILENT_CHECK_INTERVAL = 600                   # 無言チケットを確認する間隔（秒）
 SILENT_TOPIC_FLAG = ":silent"                 # 無言で自動クローズ済みの印（チャンネルトピック）
 
+# ---- 実績 ----
+JISSEKI_CHANNEL_ID = 1569067475725713609     # 完了した注文の実績を載せるチャンネル
+REVIEW_DEADLINE_HOURS = 24                   # この時間コメントがなければ、コメントなし・名前ありで載せる
+REVIEW_REMIND_SECONDS = 3600                 # コメントを催促する間隔
+REVIEW_CHECK_INTERVAL = 300                  # 催促・自動掲載を確認する間隔
+
 # ---- コマンドを使える人 ----
 # !setup_ticket・!order_panel・/nuke対策 はこのユーザーだけが使える
 COMMAND_OWNER_ID = 1462791798891090084
@@ -243,6 +252,8 @@ class SupportBot(commands.Bot):
 
         # 無言チケットの巡回（24時間注文がないチケットを自動で閉じて罰ロールを付ける）
         self.loop.create_task(silent_ticket_loop())
+        # 実績コメントの催促と、24時間後の自動掲載
+        self.loop.create_task(review_reminder_loop())
         self.loop.create_task(no_order_notice_loop())
 
         # Nuke対策（/nuke対策）。バックアップと通知は NUKE_BACKUP_USER_ID のDMに送る。
@@ -721,6 +732,7 @@ def new_order_state(owner_id):
         "owner_id": owner_id,
         "status": "draft",
         "answers": {},
+        "meta": {},
     }
 
 
@@ -733,9 +745,8 @@ def step_sequence(state):
     elif answers.get("category") == "middle":
         seq += ["partner"]
     elif answers.get("category") == "boost":
-        seq += ["service", "start", "goal"]
-        # ガチバ代行は現在ランク・目標ランクの入力後に注文内容を確定し、
-        # 支払い方法は別メッセージの専用UIで選択する。
+        # トロ上げ・ガチバは入口のメニューで選ぶ。チケットでは現在と目標を1画面で選ぶ。
+        seq += ["start"]
         if answers.get("service") == "trophy":
             seq += ["info"]
     seq.append("confirm")
@@ -759,12 +770,13 @@ def order_quote(state):
 def step_done(state, step):
     answers = state["answers"]
     if step == "category":
-        return answers.get("category") in CATEGORY_LABELS
+        category = answers.get("category")
+        if category == "boost":
+            return answers.get("service") in SERVICE_LABELS
+        return category in CATEGORY_LABELS
     if step == "service":
         return answers.get("service") in SERVICE_LABELS
-    if step == "start":
-        return answers.get("start") is not None
-    if step == "goal":
+    if step in ("start", "goal"):
         return order_quote(state) is not None
     if step == "info":
         if answers.get("service") == "ranked":
@@ -822,6 +834,30 @@ def apply_answer(state, key, value):
     if key == "start" and answers.get("goal") is not None:
         if order_quote(state) is None:
             answers.pop("goal", None)
+
+
+# 入口・チケットのメニューの値 → （区分, サービス）
+MENU_CHOICES = {
+    "trophy": ("boost", "trophy"),
+    "ranked": ("boost", "ranked"),
+    "cheat": ("cheat", None),
+    "middle": ("middle", None),
+    "boost": ("boost", None),  # 以前の入口パネル（代行をまとめて選ぶ形）
+}
+
+
+def apply_menu_choice(state, value):
+    category, service = MENU_CHOICES[value]
+    apply_answer(state, "category", category)
+    if service:
+        apply_answer(state, "service", service)
+
+
+def order_menu_value(state):
+    answers = state["answers"]
+    if answers.get("category") == "boost":
+        return answers.get("service")
+    return answers.get("category")
 
 
 def display_value(state, key):
@@ -895,9 +931,20 @@ def unbox(value):
 
 
 def parse_order_message(message):
-    """受付パネルのEmbedから注文状態を復元する（再起動対策の要）。"""
-    if message is None or not message.embeds:
+    """受付パネルから注文状態を取り出す。
+
+    新しい画面は「ORDER #番号」から保存データを読み、以前の画面（Embed）は表示内容から復元する。
+    """
+    if message is None:
         return None
+    if not message.embeds:
+        order_id = order_id_in_message(message)
+        entry = load_order(order_id) if order_id else None
+        if entry is None or entry.get("channel_id") != message.channel.id:
+            return None
+        state = copy.deepcopy(entry["state"])
+        state.setdefault("meta", {})
+        return state
 
     embed = message.embeds[0]
     footer = (embed.footer.text if embed.footer else "") or ""
@@ -932,6 +979,7 @@ def parse_order_message(message):
         "owner_id": get_ticket_owner(message.channel),
         "status": STATUS_FROM_TEXT.get(match.group(2), "draft"),
         "answers": answers,
+        "meta": {},
     }
 
 
@@ -963,407 +1011,385 @@ def _view(items):
     return view
 
 
-def _progress_header(state, step):
-    seq = step_sequence(state)
-    known = state["answers"].get("category") is not None
+# ---- 注文データの保存（新しい画面は文字だけなので、注文の中身はファイルに保存する） ----
 
-    if not known:
-        return (
-            "`STEP 1 / ?`　▰▱▱▱▱▱\n"
-            f"**▸ {step_title(state, 'category')}**　›　…　›　{step_title(state, 'confirm')}"
-        )
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ORDER_STORE_PATH = os.path.join(BASE_DIR, "data", "orders.json")
+ORDER_FOOTER_RE = re.compile(r"ORDER #([0-9A-F]{4,16})")
+# 画面右上のRSGYロゴ。環境変数で差し替えられる
+RSGY_LOGO_URL = os.getenv(
+    "RSGY_LOGO_URL",
+    "https://raw.githubusercontent.com/san0701533-stack/discord-bot/main/assets/rsgy_logo.jpg",
+).strip()
+COLOR_CHAMPAGNE = 0xB89A6A
+ORDER_KEEP_DAYS = 90
 
-    idx = seq.index(step) if step in seq else 0
-    total = len(seq)
-    bar = "▰" * (idx + 1) + "▱" * (total - idx - 1)
-    crumbs = []
-    for i, s in enumerate(seq):
-        title = step_title(state, s)
-        crumbs.append(f"**▸ {title}**" if i == idx else title)
-    return f"`STEP {idx + 1} / {total}`　{bar}\n" + "　›　".join(crumbs)
+_order_store = None
 
 
-def _status_header(state):
-    is_cheat = state["answers"].get("category") == "cheat"
-    stages = (
-        ["受付", "入金確認", "対応中", "完了"]
-        if is_cheat
-        else ["注文受付", "入金確認", "対応中", "完了"]
-    )
-    reached = {
-        "payment_select": 0,
-        "submitted": 0,
-        "link_sent": 1,
-        "received": 1,
-        "reported": 1,
-        "paid": 2,
-        "done": 3,
-    }.get(state["status"], -1)
-
-    parts = []
-    for i, name in enumerate(stages):
-        if i < reached:
-            parts.append(f"◆ {name}")
-        elif i == reached:
-            parts.append(f"**◈ {name}**")
-        else:
-            parts.append(f"◇ {name}")
-    return "　━　".join(parts)
+def _load_order_store():
+    global _order_store
+    if _order_store is None:
+        try:
+            with open(ORDER_STORE_PATH, encoding="utf-8") as f:
+                _order_store = json.load(f)
+        except FileNotFoundError:
+            _order_store = {}
+        except (OSError, ValueError) as error:
+            logger.error("注文データの読み込みに失敗しました: %s", error)
+            _order_store = {}
+    return _order_store
 
 
-def build_order_embed(state, title, body, *, header=None, color=COLOR_MAIN):
-    lines = []
-    if header:
-        lines += [header, DIVIDER]
-    lines.append(body)
+def _write_order_store():
+    store = _load_order_store()
+    cutoff = time.time() - ORDER_KEEP_DAYS * 86400
+    for order_id in [k for k, v in store.items() if v.get("updated", 0) < cutoff]:
+        store.pop(order_id, None)
+    try:
+        os.makedirs(os.path.dirname(ORDER_STORE_PATH), exist_ok=True)
+        tmp = ORDER_STORE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(store, f, ensure_ascii=False)
+        os.replace(tmp, ORDER_STORE_PATH)
+    except OSError as error:
+        logger.error("注文データの保存に失敗しました: %s", error)
 
-    embed = discord.Embed(
-        title=title,
-        description="\n".join(lines),
-        color=color,
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.set_author(name=f"◆ {BRAND_NAME}　｜　ORDER DESK")
 
-    for key in summary_keys(state):
-        text = display_value(state, key)
-        icon = "◆" if text else "◇"
-        embed.add_field(
-            name=f"{icon} {FIELD_LABELS[key]}",
-            value=box(text or EMPTY),
-            inline=key not in ("note", "detail"),
-        )
+def save_order(state, channel_id, message_id):
+    """注文の状態と、それを表示している画面（メッセージ）を記録する。"""
+    store = _load_order_store()
+    entry = store.setdefault(state["order_id"], {})
+    old = entry.get("message_id")
+    aliases = entry.setdefault("aliases", [])
+    if old and old != message_id and old not in aliases:
+        aliases.append(old)
+    entry.update({
+        "state": copy.deepcopy(state),
+        "channel_id": channel_id,
+        "message_id": message_id,
+        "updated": time.time(),
+    })
+    _write_order_store()
 
-    category = state["answers"].get("category")
+
+def load_order(order_id):
+    return _load_order_store().get(order_id)
+
+
+def find_order_by_message(channel_id, message_id):
+    for entry in _load_order_store().values():
+        if entry.get("channel_id") != channel_id:
+            continue
+        if entry.get("message_id") == message_id or message_id in entry.get("aliases", []):
+            return entry
+    return None
+
+
+def _walk_components(components):
+    for component in components or []:
+        yield component
+        for attr in ("children", "components"):
+            yield from _walk_components(getattr(component, attr, None))
+        accessory = getattr(component, "accessory", None)
+        if accessory is not None:
+            yield accessory
+
+
+def order_id_in_message(message):
+    for component in _walk_components(getattr(message, "components", None)):
+        match = ORDER_FOOTER_RE.search(getattr(component, "content", None) or "")
+        if match:
+            return match.group(1)
+    return None
+
+
+# ---- 新しい画面の部品 ----
+
+STEP_LABELS = {
+    "category": "ご依頼の種類",
+    "start": "現在と目標",
+    "info": "アカウント情報",
+    "device": "ご利用端末",
+    "detail": "ご相談内容",
+    "partner": "取引相手",
+    "confirm": "最終確認",
+    "payment": "お支払い",
+}
+
+
+def _layout(*items, accent=COLOR_CHAMPAGNE, outside=None):
+    """枠（コンテナ）1つの画面を作る。outside は枠の上に出す文（メンションなど）。"""
+    view = discord.ui.LayoutView(timeout=None)
+    if outside:
+        view.add_item(discord.ui.TextDisplay(outside))
+    container = discord.ui.Container(accent_colour=accent)
+    for item in items:
+        if item is not None:
+            container.add_item(item)
+    view.add_item(container)
+    view.stop()
+    return view
+
+
+def _text(content):
+    return discord.ui.TextDisplay(content)
+
+
+def _sep(visible=True):
+    return discord.ui.Separator(visible=visible)
+
+
+def _row(*items):
+    return discord.ui.ActionRow(*[i for i in items if i is not None])
+
+
+def _head(*lines, thumb=True):
+    """右上にロゴを置いた見出し部分。"""
+    content = "\n".join(line for line in lines if line)
+    if thumb and RSGY_LOGO_URL:
+        return discord.ui.Section(content, accessory=discord.ui.Thumbnail(RSGY_LOGO_URL))
+    return _text(content)
+
+
+def _kicker(state):
+    return f"-# RSGY　/　ORDER #{state['order_id']}"
+
+
+def _footer(state):
+    return _text(f"-# ORDER #{state['order_id']}　·　{STATUS_TEXT[state['status']]}")
+
+
+def _visible_steps(state):
+    return [s for s in step_sequence(state) if s != "category"] + ["payment"]
+
+
+def _step_line(state, step):
+    steps = _visible_steps(state)
+    if step not in steps:
+        return None
+    idx = steps.index(step) + 1
+    dots = "◆" * idx + "◇" * (len(steps) - idx)
+    return f"**STEP {idx} / {len(steps)}**　{STEP_LABELS[step]}　{dots}"
+
+
+def _price_block(label, price):
+    return f"-# {label}\n## ¥{price:,}"
+
+
+def _range_text(state):
+    """お支払い・完了・実績で使う「どこからどこまで」の説明。"""
+    answers = state["answers"]
+    category = answers.get("category")
     if category == "boost":
-        price = order_quote(state)
-        embed.add_field(
-            name="✦ お見積り",
-            value=box(f"¥ {price:,}" if price is not None else EMPTY),
-            inline=False,
-        )
-    elif category == "cheat":
-        embed.add_field(
-            name="✦ 料金",
-            value=box("スタッフが個別にご案内します"),
-            inline=False,
-        )
-    elif category == "middle":
-        embed.add_field(
-            name="✦ 仲介手数料",
-            value=box(f"¥ {MIDDLE_FEE:,}"),
-            inline=False,
-        )
-
-    embed.set_footer(
-        text=f"ORDER #{state['order_id']} ・ {STATUS_TEXT[state['status']]}"
-    )
-    if ORDER_BANNER_URL:
-        embed.set_image(url=ORDER_BANNER_URL)
-    return embed
+        start, goal = display_value(state, "start"), display_value(state, "goal")
+        if start and goal:
+            return f"{start} → {goal}"
+    if category == "middle" and answers.get("partner"):
+        return f"取引相手：{PARTNER_ID_RE.sub('', answers['partner'])}"
+    if category == "cheat" and answers.get("device"):
+        return f"端末：{display_value(state, 'device')}"
+    return None
 
 
-def _nav_items(state, step, ret, *, show_next=False):
-    items = []
-    if ret == "c" and first_incomplete(state) == "confirm":
-        items.append(_button("確認画面へ戻る", f"ord:back:{step}:c", emoji="↩️", row=4))
-    else:
-        items.append(_button(
-            "戻る", f"ord:back:{step}:n", emoji="◀️", row=4,
-            disabled=prev_step(state, step) is None,
-        ))
-    if show_next:
-        items.append(_button(
-            "次へ", f"ord:next:{step}:{ret}",
-            style=discord.ButtonStyle.primary, emoji="▶️", row=4,
-        ))
-    items.append(_button("キャンセル", f"ord:cancel:{step}", emoji="✖️", row=4))
-    return items
+def order_title(state):
+    answers = state["answers"]
+    if answers.get("category") == "boost":
+        return SERVICE_LABELS.get(answers.get("service"), "代行")
+    return CATEGORY_LABELS.get(answers.get("category"), "ご注文")
 
 
-def _choice_style(selected, value, default_primary):
-    if selected is None:
-        return discord.ButtonStyle.primary if default_primary else discord.ButtonStyle.secondary
-    return discord.ButtonStyle.primary if selected == value else discord.ButtonStyle.secondary
+def order_amount(state):
+    if state["answers"].get("category") == "cheat":
+        return state["answers"].get("amount")
+    return order_quote(state)
 
+
+def _summary_lines(state):
+    lines = []
+    for key in summary_keys(state):
+        if key in ("payment", "category", "service"):
+            continue
+        text = display_value(state, key)
+        if key == "partner" and text:
+            text = PARTNER_ID_RE.sub("", text)
+        if text:
+            lines.append(f"{FIELD_LABELS[key]}　**{text}**")
+    return lines
+
+
+def _btn(label, custom_id, *, style=discord.ButtonStyle.secondary, emoji=None, disabled=False):
+    return discord.ui.Button(label=label, custom_id=custom_id, style=style, emoji=emoji, disabled=disabled)
+
+
+# ---- 入力中の画面 ----
 
 def render_step(state, step, ret="n"):
     answers = state["answers"]
-    header = _progress_header(state, step)
     prefix = "変更 ─ " if ret == "c" else ""
     items = []
-    show_next = False
+    nav_next = False
 
     if step == "category":
-        title = f"{prefix}ご依頼の種類を選択してください"
-        body = (
-            "ご希望のメニューを下のボタンから選んでください。\n\n"
-            "⚡ **代行**\n"
-            "　└ トロ上げ代行・ガチバトル代行（料金を自動計算）\n"
-            "🧩 **チート**\n"
-            "　└ ご相談内容を伺い、スタッフが個別にご案内します\n"
-            "🤝 **仲介**\n"
-            f"　└ お取引の仲介をします（手数料 ¥{MIDDLE_FEE:,}）"
-        )
-        selected = answers.get("category")
-        items += [
-            _button("代行", f"ord:set:category:boost:{ret}", emoji="⚡", row=0,
-                    style=_choice_style(selected, "boost", True)),
-            _button("チート", f"ord:set:category:cheat:{ret}", emoji="🧩", row=0,
-                    style=_choice_style(selected, "cheat", False)),
-            _button("仲介", f"ord:set:category:middle:{ret}", emoji="🤝", row=0,
-                    style=_choice_style(selected, "middle", False)),
-        ]
-
-    elif step == "service":
-        title = f"{prefix}代行メニューを選択してください"
-        body = (
-            "ご希望の代行サービスを選んでください。\n\n"
-            f"🏆 **トロ上げ代行**　─　¥{min(TROPHY_PRICES.values()):,} 〜\n"
-            "　└ トロフィー帯を指定して代行します\n"
-            f"⚔️ **ガチバ代行**　─　¥{min(RANK_PRICES.values()):,} 〜\n"
-            "　└ ガチバトルのランクを指定して代行します"
-        )
-        selected = answers.get("service")
-        items += [
-            _button("トロ上げ代行", f"ord:set:service:trophy:{ret}", emoji="🏆", row=0,
-                    style=_choice_style(selected, "trophy", True)),
-            _button("ガチバ代行", f"ord:set:service:ranked:{ret}", emoji="⚔️", row=0,
-                    style=_choice_style(selected, "ranked", True)),
-        ]
+        items.append(_head(_kicker(state), f"## {prefix}ご依頼の種類を選んでください"))
+        items.append(_sep())
+        current = order_menu_value(state)
+        items.append(_row(discord.ui.Select(
+            custom_id=f"ord:sel:menu:{ret}",
+            placeholder="ご依頼の種類を選択",
+            options=[
+                discord.SelectOption(label=label, value=value, emoji=emoji, description=desc, default=current == value)
+                for value, label, emoji, desc in TICKET_MENU_OPTIONS
+            ],
+        )))
 
     elif step == "start":
         trophy = answers.get("service") == "trophy"
-        title = f"{prefix}{step_title(state, step)}を選択してください"
-        body = (
-            "現在の状況に最も近いものを選んでください。\n"
-            "料金表に設定のある区間のみ選択できます。"
-        )
-        current = answers.get("start")
-        if trophy:
-            options = [
-                discord.SelectOption(
-                    label=f"{s:,} トロ から",
-                    value=str(s),
-                    emoji="🏆",
-                    default=current == s,
-                )
-                for s in trophy_start_options()
-            ]
-        else:
-            options = [
-                discord.SelectOption(
-                    label=RANK_NAMES[r],
-                    value=str(r),
-                    emoji="⚔️",
-                    default=current == r,
-                )
-                for r in rank_start_options()
-            ]
-        items.append(discord.ui.Select(
-            custom_id=f"ord:sel:start:{ret}",
-            placeholder="▸ " + step_title(state, step) + "を選択",
-            options=options,
-            row=0,
-        ))
-        show_next = step_done(state, step)
-
-    elif step == "goal":
-        trophy = answers.get("service") == "trophy"
+        unit = "トロフィー" if trophy else "ランク"
+        items.append(_head(_kicker(state), _step_line(state, step), f"## {prefix}現在と目標の{unit}を選んでください"))
+        items.append(_sep())
         start = answers.get("start")
-        title = f"{prefix}{step_title(state, step)}を選択してください"
-        start_text = display_value(state, "start") or EMPTY
-        body = (
-            f"現在：**{start_text}**\n"
-            "目標を選ぶと、料金表に基づいて料金が自動で計算されます。"
-        )
+        goal = answers.get("goal")
+        if trophy:
+            start_opts = [discord.SelectOption(label=f"現在：{s:,} トロ", value=str(s), default=start == s)
+                          for s in trophy_start_options()]
+        else:
+            start_opts = [discord.SelectOption(label=f"現在：{RANK_NAMES[r]}", value=str(r), default=start == r)
+                          for r in rank_start_options()]
+        items.append(_row(discord.ui.Select(
+            custom_id=f"ord:sel:start:{ret}", placeholder=f"現在の{unit}を選択", options=start_opts,
+        )))
+        if start is None:
+            goal_select = discord.ui.Select(
+                custom_id=f"ord:sel:goal:{ret}", placeholder=f"先に現在の{unit}を選んでください",
+                options=[discord.SelectOption(label="―", value="none")], disabled=True,
+            )
+        else:
+            if trophy:
+                goal_opts = [discord.SelectOption(label=f"目標：{g:,} トロ", value=str(g),
+                                                  description=f"料金 ¥{trophy_quote(start, g):,}", default=goal == g)
+                             for g in trophy_goal_options(start)]
+            else:
+                goal_opts = [discord.SelectOption(label=f"目標：{RANK_NAMES[g]}", value=str(g),
+                                                  description=f"料金 ¥{rank_quote(start, g):,}", default=goal == g)
+                             for g in rank_goal_options(start)]
+            goal_select = discord.ui.Select(
+                custom_id=f"ord:sel:goal:{ret}", placeholder=f"目標の{unit}を選択",
+                options=goal_opts or [discord.SelectOption(label="選べる目標がありません", value="none")],
+                disabled=not goal_opts,
+            )
+        items.append(_row(goal_select))
         price = order_quote(state)
         if price is not None:
-            body += f"\n\n### お見積り　¥{price:,}"
-
-        current = answers.get("goal")
-        if trophy:
-            goals = trophy_goal_options(start)
-            options = [
-                discord.SelectOption(
-                    label=f"{g:,} トロ まで",
-                    value=str(g),
-                    description=f"料金 ¥{trophy_quote(start, g):,}",
-                    emoji="💎",
-                    default=current == g,
-                )
-                for g in goals
-            ]
-        else:
-            goals = rank_goal_options(start)
-            options = [
-                discord.SelectOption(
-                    label=RANK_NAMES[g],
-                    value=str(g),
-                    description=f"料金 ¥{rank_quote(start, g):,}",
-                    emoji="💎",
-                    default=current == g,
-                )
-                for g in goals
-            ]
-        if options:
-            items.append(discord.ui.Select(
-                custom_id=f"ord:sel:goal:{ret}",
-                placeholder="▸ " + step_title(state, step) + "を選択",
-                options=options,
-                row=0,
-            ))
-        else:
-            body += "\n\n⚠️ この開始地点から選べる目標がありません。戻って選び直してください。"
-        show_next = step_done(state, step)
+            items.append(_sep())
+            items.append(_text(_price_block("お見積り", price) + "\n-# 料金表に基づいて自動で計算しています"))
+        nav_next = step_done(state, step)
 
     elif step == "info":
-        trophy = answers.get("service") == "trophy"
-        title = f"{prefix}アカウント情報を入力してください"
-        lines = ["下のボタンから追加情報を入力してください。\n"]
-        if trophy:
-            lines.append("◆ **プレイヤータグ**（必須）　例：`#ABC123`")
-            lines.append("◆ **対象キャラ**（任意）")
-        else:
-            lines.append("◆ **プレイヤータグの入力は不要です**")
-        lines += [
+        items.append(_head(_kicker(state), _step_line(state, step), f"## {prefix}アカウント情報を入力してください"))
+        items.append(_sep())
+        lines = [
+            "◆ **プレイヤータグ**（必須）　例：`#ABC123`",
+            "◆ **対象キャラ**（任意）",
             "◆ **備考**（任意）　希望納期など",
-            "",
-            "🔐 パスワードや認証コードは**入力しないでください**。",
+            "-# 🔐 パスワードや認証コードは入力しないでください",
         ]
-        body = "\n".join(lines)
+        if answers.get("tag"):
+            lines.append(f"\n入力済み：**{answers['tag']}**　/　{answers.get('brawler') or 'なし'}　/　{answers.get('note') or 'なし'}")
+        items.append(_text("\n".join(lines)))
         done = step_done(state, step)
-        items.append(_button(
-            "入力内容を修正する" if done else "情報を入力する",
-            f"ord:open:info:{ret}",
-            style=discord.ButtonStyle.secondary if done else discord.ButtonStyle.primary,
-            emoji="📝",
-            row=0,
-        ))
-        show_next = done
-
-    elif step == "payment":
-        title = f"{prefix}お支払い方法を選択してください"
-        body = (
-            "ご希望のお支払い方法を選んでください。\n\n"
-            "💳 **PayPay**\n　└ お客様が専用フォームからリンクを送信します\n"
-            "🪙 **LTC（仮想通貨）**\n　└ 指定のLTCアドレスをご案内します"
-        )
-        selected = answers.get("payment")
-        items += [
-            _button("PayPay", f"ord:set:payment:paypay:{ret}", emoji="💳", row=0,
-                    style=_choice_style(selected, "paypay", True)),
-            _button("LTC（仮想通貨）", f"ord:set:payment:ltc:{ret}", emoji="🪙", row=0,
-                    style=_choice_style(selected, "ltc", True)),
-        ]
-        show_next = step_done(state, step)
+        items.append(_row(_btn("入力内容を修正する" if done else "情報を入力する", f"ord:open:info:{ret}",
+                               style=discord.ButtonStyle.secondary if done else discord.ButtonStyle.primary, emoji="📝")))
+        nav_next = done
 
     elif step == "device":
-        title = f"{prefix}ご利用の端末を選択してください"
-        body = "ご相談の対象となる端末を選んでください。"
+        items.append(_head(_kicker(state), _step_line(state, step), f"## {prefix}ご利用の端末を選んでください"))
+        items.append(_sep())
         selected = answers.get("device")
-        items += [
-            _button("iOS", f"ord:set:device:ios:{ret}", emoji="📱", row=0,
-                    style=_choice_style(selected, "ios", True)),
-            _button("Android", f"ord:set:device:android:{ret}", emoji="🤖", row=0,
-                    style=_choice_style(selected, "android", True)),
-        ]
+        items.append(_row(
+            _btn("iOS", f"ord:set:device:ios:{ret}", emoji="📱",
+                 style=discord.ButtonStyle.primary if selected == "ios" else discord.ButtonStyle.secondary),
+            _btn("Android", f"ord:set:device:android:{ret}", emoji="🤖",
+                 style=discord.ButtonStyle.primary if selected == "android" else discord.ButtonStyle.secondary),
+        ))
 
     elif step == "detail":
-        title = f"{prefix}ご相談内容を入力してください"
-        body = (
-            "下のボタンから入力フォームを開き、ご相談内容をご記入ください。\n"
-            "内容を確認したうえで、スタッフが個別にご案内します。\n\n"
-            "🔐 パスワードや認証コードは**入力しないでください**。"
-        )
+        items.append(_head(_kicker(state), _step_line(state, step), f"## {prefix}ご相談内容を入力してください"))
+        items.append(_sep())
+        body = "内容を確認したうえで、スタッフが個別にご案内します。\n-# 🔐 パスワードや認証コードは入力しないでください"
+        if answers.get("detail"):
+            body += f"\n\n入力済み：\n> {answers['detail'][:300]}"
+        items.append(_text(body))
         done = step_done(state, step)
-        items.append(_button(
-            "入力内容を修正する" if done else "相談内容を入力する",
-            f"ord:open:detail:{ret}",
-            style=discord.ButtonStyle.secondary if done else discord.ButtonStyle.primary,
-            emoji="📝",
-            row=0,
-        ))
-        show_next = done
+        items.append(_row(_btn("入力内容を修正する" if done else "相談内容を入力する", f"ord:open:detail:{ret}",
+                               style=discord.ButtonStyle.secondary if done else discord.ButtonStyle.primary, emoji="📝")))
+        nav_next = done
 
     elif step == "partner":
-        title = f"{prefix}取引相手を入力してください"
-        current = answers.get("partner")
+        items.append(_head(_kicker(state), _step_line(state, step), f"## {prefix}取引相手を入力してください"))
+        items.append(_sep())
         body = (
-            "下のボタンから、取引したい相手の **ユーザーネーム** を入力してください。\n"
-            "相手はこのサーバーに参加している必要があります。\n\n"
-            f"◆ 仲介手数料：**¥{MIDDLE_FEE:,}**（PayPay）\n"
-            "◆ PayPayリンクの送信後、取引相手がこのチケットを見られるようになり、スタッフが対応します。"
+            "取引したい相手の **ユーザーネーム** を入力してください。相手はこのサーバーに参加している必要があります。\n"
+            f"-# 仲介手数料 ¥{MIDDLE_FEE:,}（PayPay）　·　お支払い後、取引相手がこのチケットに入ります"
         )
-        if current:
-            body += f"\n\n現在の取引相手：**{current}**"
+        if answers.get("partner"):
+            body += f"\n\n現在の取引相手：**{PARTNER_ID_RE.sub('', answers['partner'])}**"
+        items.append(_text(body))
         done = step_done(state, step)
-        items.append(_button(
-            "取引相手を変更する" if done else "取引相手を入力する",
-            f"ord:open:partner:{ret}",
-            style=discord.ButtonStyle.secondary if done else discord.ButtonStyle.primary,
-            emoji="🤝",
-            row=0,
-        ))
-        show_next = done
+        items.append(_row(_btn("取引相手を変更する" if done else "取引相手を入力する", f"ord:open:partner:{ret}",
+                               style=discord.ButtonStyle.secondary if done else discord.ButtonStyle.primary, emoji="🤝")))
+        nav_next = done
 
     else:
         return render_panel(state)
 
-    items += _nav_items(state, step, ret, show_next=show_next)
-    embed = build_order_embed(state, title, body, header=header)
-    return embed, _view(items)
+    items.append(_sep())
+    if ret == "c" and first_incomplete(state) == "confirm":
+        nav = [_btn("確認画面へ戻る", f"ord:back:{step}:c", emoji="↩️")]
+    else:
+        nav = [_btn("戻る", f"ord:back:{step}:n", emoji="◀️", disabled=prev_step(state, step) is None)]
+    if nav_next:
+        nav.append(_btn("次へ", f"ord:next:{step}:{ret}", style=discord.ButtonStyle.primary, emoji="▶️"))
+    items.append(_row(*nav))
+    items.append(_footer(state))
+    return _layout(*items)
 
 
 def render_confirm(state):
-    header = _progress_header(state, "confirm")
     is_cheat = state["answers"].get("category") == "cheat"
-
+    items = [
+        _head(_kicker(state), _step_line(state, "confirm"), "## この内容でよろしいですか？"),
+        _sep(),
+        _text("\n".join([f"区分　**{order_title(state)}**"] + _summary_lines(state))),
+        _sep(),
+    ]
     if is_cheat:
-        title = "ご相談内容の最終確認"
-        body = (
-            "以下の内容でよろしければ **スタッフへ送信** を押してください。\n"
-            "送信後、担当スタッフが料金を個別にご案内します。\n"
-            "あわせて、お支払い専用の画面を別に表示します。"
-        )
-        submit_label = "スタッフへ送信"
+        items.append(_text("-# 料金\n### スタッフが個別にご案内します\n-# 送信後、このチケットで金額をご案内します"))
     else:
-        price = order_quote(state)
-        title = "ご注文内容の最終確認"
-        body = (
-            "以下の内容でお間違いなければ **注文を確定** を押してください。\n\n"
-            f"### お見積り金額　¥{price:,}\n"
-            "注文確定後、お支払い専用の画面を別に表示します。"
-        )
-        submit_label = "注文を確定"
-
+        items.append(_text(_price_block("合計", order_quote(state))))
     options = []
     for step in step_sequence(state)[:-1]:
-        current = None
-        if step == "info":
-            current = display_value(state, "tag") or display_value(state, "note")
-        elif step in FIELD_LABELS:
+        if step == "start":
+            current = _range_text(state)
+        elif step == "info":
+            current = display_value(state, "tag")
+        elif step == "category":
+            current = order_title(state)
+        else:
             current = display_value(state, step)
+            if step == "partner" and current:
+                current = PARTNER_ID_RE.sub("", current)
         options.append(discord.SelectOption(
-            label=f"{step_title(state, step)} を変更",
-            value=step,
-            description=(current or "未入力")[:90],
-            emoji="✏️",
+            label=f"{STEP_LABELS.get(step, step)} を変更", value=step,
+            description=(current or "未入力")[:90], emoji="✏️",
         ))
-
-    items = [
-        discord.ui.Select(
-            custom_id="ord:edit",
-            placeholder="✏️ 内容を変更する項目を選択",
-            options=options,
-            row=0,
-        ),
-        _button(submit_label, "ord:submit", style=discord.ButtonStyle.primary,
-                emoji="✅", row=1),
-    ]
-    items += _nav_items(state, "confirm", "n")
-    embed = build_order_embed(state, title, body, header=header, color=COLOR_DEEP)
-    return embed, _view(items)
+    items.append(_row(discord.ui.Select(custom_id="ord:edit", placeholder="✏️ 内容を変更する項目を選択", options=options)))
+    items.append(_row(
+        _btn("スタッフへ送信" if is_cheat else "注文を確定", "ord:submit", style=discord.ButtonStyle.success, emoji="✅"),
+        _btn("キャンセル", "ord:cancel:confirm", emoji="✖️"),
+    ))
+    items.append(_footer(state))
+    return _layout(*items)
 
 
 def paypay_link_for(amount):
@@ -1372,169 +1398,161 @@ def paypay_link_for(amount):
     return PAYPAY_LINK or None
 
 
+# ---- お支払い・進み具合・完了 ----
+
+def _timeline(state):
+    status = state["status"]
+    payment = state["answers"].get("payment")
+    pay_label = "LTC送金報告" if payment == "ltc" else "PayPayリンク送信"
+    amount = order_amount(state)
+    first = f"注文受付　{order_title(state)}" + (f"　¥{amount:,}" if amount else "")
+    steps = [first, pay_label, "入金確認", "対応中", "完了"]
+    reached = {"link_sent": 2, "reported": 2, "received": 3, "paid": 3, "done": 5}.get(status, 1)
+    lines = []
+    for i, label in enumerate(steps):
+        if i < reached:
+            lines.append(f"✅　{label}")
+        elif i == reached:
+            lines.append(f"⏳　**{label}**")
+        else:
+            lines.append(f"▫️　{label}")
+    return "\n".join(lines)
+
+
 def render_status(state):
     status = state["status"]
-    is_cheat = state["answers"].get("category") == "cheat"
-    header = _status_header(state)
-    oid = state["order_id"]
-    items = []
-    color = COLOR_MAIN
+    answers = state["answers"]
+    is_cheat = answers.get("category") == "cheat"
+    is_middle = answers.get("category") == "middle"
+    owner = f"<@{state['owner_id']}>" if state.get("owner_id") else ""
+    has_payment_flow = not is_cheat or bool(answers.get("payment"))
+    range_text = _range_text(state)
 
-    # チートは料金を個別案内するため、金額はスタッフの案内に従ってもらう
-    if is_cheat:
-        price_heading = (
-            "### お支払い金額　スタッフがご案内した金額\n"
-            "※ 料金はスタッフがこのチケットで個別にご案内します。金額の案内を受けてからお支払いください。\n"
-        )
-    elif status in ("payment_select", "submitted"):
-        price_heading = f"### お支払い金額　¥{order_quote(state):,}\n"
-    else:
-        price_heading = ""
-    # 旧フロー（支払い方法なし）で送信済みのチート相談は、従来の画面のまま扱う
-    has_payment_flow = not is_cheat or bool(state["answers"].get("payment"))
+    def price_text():
+        if is_cheat:
+            return "-# お支払い金額\n### スタッフがご案内した金額\n-# 金額の案内を受けてからお支払いください"
+        return _price_block("お支払い金額", order_quote(state))
 
-    if status == "payment_select" and state["answers"].get("category") == "middle":
-        title = "お支払い専用メニュー"
-        body = (
-            f"{price_heading}"
-            "仲介手数料のお支払いはPayPayのみです。\n\n"
-            "💳 **PayPay**　選択すると受け取りリンクの入力画面が開きます。リンクはチケットに表示されません。\n"
-            "リンクを送信すると、取引相手がこのチケットを見られるようになり、スタッフが対応します。"
-        )
-        items.extend([
-            _button("PayPay", "ord:pay:paypay", style=discord.ButtonStyle.primary, emoji="💳", row=0),
-            _button("注文を取り消す", "ord:cancel:payment", emoji="✖️", row=1),
-        ])
+    if status == "payment_select":
+        items = [
+            _head(_kicker(state), _step_line(state, "payment")),
+            _text(price_text() + (f"\n-# {range_text}" if range_text else "")),
+            _sep(),
+            discord.ui.Section(
+                "**💳 PayPay**\n-# 受け取りリンクを専用フォームから送信。チケットにリンクは出ません",
+                accessory=_btn("PayPayで支払う", "ord:pay:paypay", style=discord.ButtonStyle.primary),
+            ),
+        ]
+        if not is_middle:
+            items.append(discord.ui.Section(
+                "**🪙 LTC（仮想通貨）**\n-# 送金先アドレスを表示します",
+                accessory=_btn("LTCで支払う", "ord:pay:ltc"),
+            ))
+        items += [_sep(), _text("-# リンクはチャットに貼らず、必ずフォームから送ってください"), _footer(state)]
+        return _layout(*items, outside=f"{owner} お支払いのご案内です。")
 
-    elif status == "payment_select":
-        title = "お支払い専用メニュー"
-        body = (
-            f"{price_heading}"
-            "この画面はお支払い専用です。ご希望の方法を選択してください。\n\n"
-            "💳 **PayPay**　選択すると受け取りリンクの入力画面が開きます。リンクはチケットに表示されません。\n"
-            "🪙 **LTC（仮想通貨）**　送金先アドレスを表示します。送金後はお客様ご自身で報告してください。"
-        )
-        items.extend([
-            _button("PayPay", "ord:pay:paypay", style=discord.ButtonStyle.primary, emoji="💳", row=0),
-            _button("LTC（仮想通貨）", "ord:pay:ltc", style=discord.ButtonStyle.secondary, emoji="🪙", row=0),
-            _button("注文を取り消す", "ord:cancel:payment", emoji="✖️", row=1),
-        ])
-
-    elif status == "submitted" and has_payment_flow:
-        payment = state["answers"].get("payment")
-        title = "お見積り・お支払いのご案内"
-        if payment == "ltc":
-            body = (
-                f"{price_heading}"
-                "**お支払い方法：LTC（仮想通貨）**\n\n"
-                "下記のアドレスにLTCで送金してください。\n"
+    if status == "submitted" and has_payment_flow:
+        items = [_head(_kicker(state), _step_line(state, "payment")),
+                 _text(price_text() + (f"\n-# {range_text}" if range_text else "")), _sep()]
+        if answers.get("payment") == "ltc":
+            items.append(_text(
+                "**お支払い方法：LTC（仮想通貨）**\n下記のアドレスにLTCで送金してください。\n"
                 f"```\n{LTC_ADDRESS}\n```\n"
-                "送金先アドレス `LbuHqe7Uy5NgqGYi2AT544aY41CcYiSMcs` を一文字も間違えずに送金しましたか？\n"
-                "送金が完了したら、下の「はい、送金しました」を押してください。\n\n"
-                "※ スタッフが送金状況を確認します。"
-            )
-            items.append(_button("LTCアドレスを表示", "ord:copy:ltc", emoji="📋", row=0))
-            items.append(_button(
-                "はい、送金しました", "ord:report",
-                style=discord.ButtonStyle.primary, emoji="✅", row=0,
+                "アドレスを一文字も間違えずに送金したら、「はい、送金しました」を押してください。"
+            ))
+            items.append(_row(
+                _btn("LTCアドレスを表示", "ord:copy:ltc", emoji="📋"),
+                _btn("はい、送金しました", "ord:report", style=discord.ButtonStyle.primary, emoji="✅"),
             ))
         else:
-            body = (
-                f"{price_heading}"
-                "**お支払い方法：PayPay**\n\n"
-                "下の「PayPayリンクを入力・送信」ボタンから、PayPay受け取りリンクを入力してください。\n"
-                "送信されたリンクは指定アカウントのDMにのみ転送され、チケットにはリンク自体を表示しません。\n\n"
-                "※ リンクはチャット欄に直接貼らず、必ず専用フォームから送信してください。"
-            )
-            items.append(_button(
-                "PayPayリンクを入力・送信", "ord:p:paypay_open",
-                style=discord.ButtonStyle.primary, emoji="💳", row=0,
+            items.append(_text(
+                "**お支払い方法：PayPay**\n下のボタンから、PayPay受け取りリンクを送信してください。\n"
+                "-# リンクは担当アカウントのDMにだけ届き、チケットには表示されません"
             ))
-        items.append(_button("注文を取り消す", "ord:cancel:pay", emoji="✖️", row=1))
+            items.append(_row(_btn("PayPayリンクを入力・送信", "ord:p:paypay_open",
+                                   style=discord.ButtonStyle.primary, emoji="💳")))
+        items.append(_footer(state))
+        return _layout(*items)
 
-    elif status == "link_sent":
-        title = "PayPayの受け取り確認中です"
-        body = (
-            "PayPay受け取りリンクを受け付け、担当アカウントへ送信しました。\n"
-            f"リンク：{mask_paypay_link()}\n\n"
-            "現在、担当者が受け取りを確認しています。\n"
-            "受け取りが確認されると、スタッフが次の対応へ進みます。しばらくお待ちください。"
+    if status == "submitted":  # 支払い方法がない旧形式のチート相談
+        return _layout(
+            _head(_kicker(state), "## ご相談をスタッフへ送信しました", "担当スタッフが内容を確認しています。このチャンネルでのご連絡をお待ちください。"),
+            _footer(state),
         )
-        color = COLOR_GLOW
 
-    elif status == "received":
-        title = "PayPayの受け取りを確認しました"
-        body = (
-            "担当者がPayPayの受け取りを確認しました。\n"
-            "スタッフが対応を開始するまで、しばらくお待ちください。"
+    if status in ("link_sent", "received", "reported", "paid"):
+        headings = {
+            "link_sent": ("入金を確認しています", "担当者がPayPayの受け取りを確認中です。確認が取れ次第、スタッフが対応します。"),
+            "reported": ("入金を確認しています", "送金のご報告ありがとうございます。スタッフが入金を確認しています。"),
+            "received": ("お支払いを確認しました", "スタッフが対応を開始するまで、しばらくお待ちください。"),
+            "paid": ("対応中です", "担当スタッフが対応しています。進行状況はこのチャンネルでご連絡します。"),
+        }
+        title, body = headings[status]
+        return _layout(
+            _head(_kicker(state), f"## {title}", body),
+            _sep(),
+            _text(_timeline(state)),
+            _text("-# ご不明な点は、このチャンネルにそのまま書き込んでください"),
+            _footer(state),
         )
-        color = COLOR_GLOW
 
-    elif status == "submitted":
-        title = "ご相談をスタッフへ送信しました"
-        body = (
-            "担当スタッフが内容を確認しています。\n"
-            "このチャンネルでのご連絡をお待ちください。"
-        )
-        items.append(_button("相談を取り消す", "ord:cancel:pay", emoji="✖️", row=0))
+    if status == "done":
+        review = state.get("meta", {}).get("review", {})
+        amount = order_amount(state)
+        summary = [f"内容　**{order_title(state)}**" + (f"　{range_text}" if range_text else "")]
+        if amount:
+            summary.append(f"金額　**¥{amount:,}**" + (f"（{PAYMENT_LABELS.get(answers.get('payment'), '')}）" if answers.get("payment") else ""))
+        items = [
+            _head(
+                _kicker(state),
+                "# ご依頼が完了しました",
+                "ご利用ありがとうございました。またのご依頼をお待ちしております。\n"
+                "確認が終わったら、このチケットを消してください。",
+            ),
+            _sep(),
+            _text("\n".join(summary)),
+            _sep(),
+        ]
+        if review.get("status") == "posted":
+            items.append(_text("-# ✅ 実績に掲載しました。ありがとうございました！"))
+            buttons = []
+        else:
+            items.append(_text(
+                "**実績へのコメントをお願いします**\n"
+                "-# いただいたコメントは実績チャンネルに載せます。名前を伏せることもできます。\n"
+                f"-# {REVIEW_DEADLINE_HOURS}時間以内にコメントがない場合は、コメントなし・お名前ありで載せます。"
+            ))
+            buttons = [_btn("実績にコメントする", "ord:open:review:n", style=discord.ButtonStyle.primary, emoji="✍️")]
+        buttons += [
+            _btn("新しく注文する", "ord:restart", emoji="✨"),
+            _btn("チケットを削除", "ord:delete", style=discord.ButtonStyle.danger, emoji="🗑️"),
+        ]
+        items += [_row(*buttons), _footer(state)]
+        return _layout(*items, outside=owner)
 
-    elif status == "reported":
-        title = "入金を確認しています"
-        body = (
-            "お支払いのご報告ありがとうございます。\n"
-            "スタッフが入金を確認するまで、しばらくお待ちください。"
-        )
-        color = COLOR_GLOW
-
-    elif status == "paid":
-        title = "対応を開始しました"
-        body = (
-            "スタッフが内容を確認し、対応を開始しました。\n"
-            "進行状況はこのチャンネルでご連絡します。"
-            if is_cheat and not has_payment_flow else
-            "入金を確認しました。担当スタッフが対応を開始します。\n"
-            "進行状況はこのチャンネルでご連絡します。"
-            if is_cheat else
-            "入金を確認しました。担当スタッフが代行を開始します。\n"
-            "進行状況はこのチャンネルでご連絡します。"
-        )
-        color = COLOR_GLOW
-
-    elif status == "done":
-        title = "ご依頼が完了しました"
-        body = "ご利用ありがとうございました。またのご依頼をお待ちしております。"
-        color = COLOR_WHITE
-        items.append(_button("新しく注文する", "ord:restart",
-                             style=discord.ButtonStyle.primary, emoji="✨", row=0))
-
-    else:  # cancelled
-        title = "ご注文はキャンセルされました"
-        body = "もう一度ご依頼される場合は、下のボタンから最初からやり直せます。"
-        header = None
-        color = COLOR_VOID
-        items.append(_button("最初からやり直す", "ord:restart",
-                             style=discord.ButtonStyle.primary, emoji="🔄", row=0))
-
-    embed = build_order_embed(state, title, body, header=header, color=color)
-    return embed, _view(items)
+    # cancelled
+    return _layout(
+        _head(_kicker(state), "## ご注文はキャンセルされました", "もう一度ご依頼される場合は、下のボタンから最初からやり直せます。"),
+        _row(_btn("最初からやり直す", "ord:restart", style=discord.ButtonStyle.primary, emoji="🔄")),
+        _footer(state),
+    )
 
 
 def render_cancel_confirm(state, back_to):
     submitted = state["status"] != "draft"
-    title = "ご注文をキャンセルしますか？"
     body = (
         "キャンセルすると、この注文は取り消されスタッフにも通知されます。"
         if submitted else
         "入力した内容は破棄されます。キャンセル後は最初からやり直せます。"
     )
-    items = [
-        _button("キャンセルする", "ord:cxy", style=discord.ButtonStyle.danger,
-                emoji="🗑️", row=0),
-        _button("続ける", f"ord:cxn:{back_to}", style=discord.ButtonStyle.primary,
-                emoji="↩️", row=0),
-    ]
-    embed = build_order_embed(state, title, body, color=COLOR_VOID)
-    return embed, _view(items)
+    return _layout(
+        _head(_kicker(state), "## ご注文をキャンセルしますか？", body),
+        _row(
+            _btn("キャンセルする", "ord:cxy", style=discord.ButtonStyle.danger, emoji="🗑️"),
+            _btn("続ける", f"ord:cxn:{back_to}", style=discord.ButtonStyle.primary, emoji="↩️"),
+        ),
+        _footer(state),
+    )
 
 
 def render_panel(state, step=None, ret="n"):
@@ -1546,6 +1564,61 @@ def render_panel(state, step=None, ret="n"):
             return render_step(state, first_incomplete(state), "n")
         return render_confirm(state)
     return render_step(state, step, ret)
+
+
+def render_welcome(member):
+    """チケットを開いたときの「ようこそ」（消さずに残す）。"""
+    return _layout(
+        _head(
+            "-# RSGY　/　ORDER DESK",
+            f"# ようこそ、{member.display_name} さん",
+            "このチケットはあなた専用です。メニューを順番に選ぶだけで、ご注文からお支払いまで完了します。",
+        ),
+        _sep(),
+        _row(_btn("チケットを閉じる", "ticket:close", style=discord.ButtonStyle.danger, emoji="🔒")),
+        _text("-# 内容の変更はいつでもできます　·　パネルはご本人だけが操作できます"),
+        outside=member.mention,
+    )
+
+
+# ---- 画面の送信・更新 ----
+
+PANEL_MENTIONS = discord.AllowedMentions(users=True, roles=False, everyone=False)
+
+
+async def repost_panel(channel, old_message, state, view=None):
+    """新しい画面を出してから、前の画面を消す。送信に失敗したら前の画面は残す。"""
+    view = view or render_panel(state)
+    try:
+        new_message = await channel.send(view=view, allowed_mentions=PANEL_MENTIONS)
+    except discord.HTTPException as error:
+        log_http_error("注文画面の送信", error)
+        return None
+    save_order(state, channel.id, new_message.id)
+    if old_message is not None:
+        try:
+            await old_message.delete()
+        except discord.HTTPException as error:
+            log_http_error("前の注文画面の削除", error)
+    return new_message
+
+
+async def edit_panel(message, state, view=None):
+    """画面をその場で書き換える（旧形式の画面は新しい形式で出し直す）。"""
+    view = view or render_panel(state)
+    if message.embeds:
+        new_message = await repost_panel(message.channel, message, state, view)
+        if new_message is None:
+            raise discord.HTTPException(_FakeResponse(), "注文画面を出し直せませんでした")
+        return new_message
+    await message.edit(view=view, allowed_mentions=PANEL_MENTIONS)
+    save_order(state, message.channel.id, message.id)
+    return message
+
+
+class _FakeResponse:
+    status = 0
+    reason = "repost failed"
 
 
 # ---- モーダル（入力フォーム） ----
@@ -1658,6 +1731,9 @@ def modal_values(data):
         if isinstance(node, dict):
             if "custom_id" in node and "value" in node:
                 values[node["custom_id"]] = node["value"]
+            elif "custom_id" in node and "values" in node:
+                picked = node["values"] or []
+                values[node["custom_id"]] = picked[0] if picked else ""
             for child in node.values():
                 walk(child)
         elif isinstance(node, list):
@@ -1805,12 +1881,11 @@ async def notify_staff(guild, ticket_channel, panel_message, state, title):
     )
 
 
-async def send_order_panel(channel, owner_id, category=None):
+async def send_order_panel(channel, owner_id, choice=None):
     state = new_order_state(owner_id)
-    if category in CATEGORY_LABELS:
-        apply_answer(state, "category", category)
-    embed, view = render_panel(state)
-    return await safe_send(channel, None, embed=embed, view=view)
+    if choice in MENU_CHOICES:
+        apply_menu_choice(state, choice)
+    return await repost_panel(channel, None, state)
 
 
 # ==========================================
@@ -1827,17 +1902,31 @@ async def _ephemeral(interaction, text):
         log_http_error("エフェメラル返信", error)
 
 
-async def _show(interaction, state, step=None, ret="n"):
-    embed, view = render_panel(state, step, ret)
-    await interaction.response.edit_message(embed=embed, view=view)
+async def _show_view(interaction, state, view, *, new_page=False):
+    """新しいページにするときは前の画面を消して出し直し、それ以外はその場で書き換える。"""
+    message = interaction.message
+    if new_page or message is None or message.embeds:
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+        new_message = await repost_panel(interaction.channel, message, state, view)
+        if new_message is None:
+            await _ephemeral(interaction, "画面を更新できませんでした。もう一度お試しください。")
+        return new_message
+    await interaction.response.edit_message(view=view, allowed_mentions=PANEL_MENTIONS)
+    save_order(state, interaction.channel.id, message.id)
+    return message
+
+
+async def _show(interaction, state, step=None, ret="n", *, new_page=False):
+    return await _show_view(interaction, state, render_panel(state, step, ret), new_page=new_page)
 
 
 async def _show_after_answer(interaction, state, step, ret):
     # 通常時は次の質問へ。確認画面からの変更時は、未入力があればそこへ、
-    # なければ確認画面へ戻る（以降は通常の流れに戻す）。
+    # なければ確認画面へ戻る（以降は通常の流れに戻す）。次のステップは新しいページで出す。
     target = first_incomplete(state) if ret == "c" else next_step(state, step)
     mode = "c" if (ret == "c" and target != "confirm") else "n"
-    await _show(interaction, state, target, mode)
+    await _show(interaction, state, target, mode, new_page=target != step)
 
 
 def _ticket_closed_for(channel, owner_id):
@@ -1857,6 +1946,7 @@ async def handle_customer_action(interaction, parts):
     # 「通信エラーが発生しました。もう一度お試しください。」を案内する。
     if message is not None and channel is not None:
         message = await channel.fetch_message(message.id)
+        interaction.message = message
     state = parse_order_message(message)
 
     if state is None or not is_ticket(channel):
@@ -1871,30 +1961,40 @@ async def handle_customer_action(interaction, parts):
         )
         return
 
-    if _ticket_closed_for(channel, owner_id):
+    action = parts[1]
+    is_review = action in ("open", "modal") and len(parts) > 2 and parts[2] == "review"
+
+    if not is_review and _ticket_closed_for(channel, owner_id):
         await _ephemeral(interaction, "このチケットはクローズされています。")
         return
 
-    action = parts[1]
-
     # ---- 入力中のみ許可する操作 ----
     draft_actions = {"set", "sel", "open", "modal", "back", "next", "edit", "submit"}
-    if action in draft_actions and state["status"] != "draft":
+    if action in draft_actions and not is_review and state["status"] != "draft":
         await _ephemeral(interaction, "この注文はすでに確定しています。")
         return
 
-    if action == "set":            # ord:set:<key>:<value>:<ret>
+    if action == "set":            # ord:set:<key>:<value>:<ret>（以前の画面のボタンも含む）
         key, value, ret = parts[2], parts[3], parts[4]
         allowed = {"category": CATEGORY_LABELS, "service": SERVICE_LABELS, "device": DEVICE_LABELS, "payment": PAYMENT_LABELS}
         if key not in allowed or value not in allowed[key]:
             return await _ephemeral(interaction, "不正な選択です。")
         apply_answer(state, key, value)
+        if key in ("category", "service"):
+            return await _show(interaction, state, first_incomplete(state), "n", new_page=True)
         return await _show_after_answer(interaction, state, key, ret)
 
     if action == "sel":            # ord:sel:<key>:<ret>
         key, ret = parts[2], parts[3]
         values = (interaction.data or {}).get("values") or []
-        if key not in ("start", "goal") or not values:
+        if not values:
+            return await _ephemeral(interaction, "不正な選択です。")
+        if key == "menu":
+            if values[0] not in MENU_CHOICES:
+                return await _ephemeral(interaction, "不正な選択です。")
+            apply_menu_choice(state, values[0])
+            return await _show(interaction, state, first_incomplete(state), "n", new_page=True)
+        if key not in ("start", "goal"):
             return await _ephemeral(interaction, "不正な選択です。")
         try:
             value = int(values[0])
@@ -1909,10 +2009,16 @@ async def handle_customer_action(interaction, parts):
         if value not in valid:
             return await _ephemeral(interaction, "料金表にない区間は選択できません。")
         apply_answer(state, key, value)
-        return await _show_after_answer(interaction, state, key, ret)
+        # 現在と目標は同じ画面で選ぶので、その場で書き換える
+        return await _show(interaction, state, "start", ret)
 
-    if action == "open":           # ord:open:<info|detail>:<ret>
+    if action == "open":           # ord:open:<info|detail|partner|review>:<ret>
         key, ret = parts[2], parts[3]
+        if key == "review":
+            if state["status"] != "done" or state.get("meta", {}).get("review", {}).get("status") == "posted":
+                return await _ephemeral(interaction, "この注文の実績はすでに掲載済みです。")
+            await interaction.response.send_modal(build_review_modal())
+            return
         if key == "info":
             modal = build_info_modal(state, ret)
         elif key == "partner":
@@ -1922,9 +2028,11 @@ async def handle_customer_action(interaction, parts):
         await interaction.response.send_modal(modal)
         return
 
-    if action == "modal":          # ord:modal:<info|detail>:<ret>
+    if action == "modal":          # ord:modal:<info|detail|partner|review>:<ret>
         key, ret = parts[2], parts[3]
         values = modal_values(interaction.data)
+        if key == "review":
+            return await submit_review(interaction, state, values)
         if key == "info":
             if state["answers"].get("service") == "trophy":
                 tag = normalize_tag(values.get("tag"))
@@ -1960,9 +2068,9 @@ async def handle_customer_action(interaction, parts):
     if action == "back":           # ord:back:<step>:<ret>
         step, ret = parts[2], parts[3]
         if ret == "c" and first_incomplete(state) == "confirm":
-            return await _show(interaction, state, "confirm")
+            return await _show(interaction, state, "confirm", new_page=True)
         target = prev_step(state, step) or "category"
-        return await _show(interaction, state, target)
+        return await _show(interaction, state, target, new_page=True)
 
     if action == "next":           # ord:next:<step>:<ret>
         step, ret = parts[2], parts[3]
@@ -1970,40 +2078,22 @@ async def handle_customer_action(interaction, parts):
             return await _ephemeral(interaction, "先にこの項目を選択・入力してください。")
         return await _show_after_answer(interaction, state, step, ret)
 
-    if action == "edit":           # ord:edit（セレクト）
+    if action == "edit":           # ord:edit（確認画面のセレクト）
         values = (interaction.data or {}).get("values") or []
         step = values[0] if values else None
         if step not in step_sequence(state)[:-1]:
             return await _ephemeral(interaction, "変更できない項目です。")
-        return await _show(interaction, state, step, "c")
+        return await _show(interaction, state, step, "c", new_page=True)
 
     if action == "submit":
         if first_incomplete(state) != "confirm":
             return await _ephemeral(interaction, "未入力の項目があります。")
         is_cheat = state["answers"].get("category") == "cheat"
-        # 代行・チート共通：注文内容を確定し、支払い方法は別メッセージの専用UIで選択する
+        # 注文内容を確定し、確認画面を消してお支払いの画面を出す
         state["status"] = "payment_select"
-        intake_embed = build_order_embed(
-            state,
-            "ご相談内容を受け付けました" if is_cheat else "注文内容を受け付けました",
-            (
-                "ご相談内容をスタッフへ送信しました。料金はスタッフがこのチャンネルで個別にご案内します。\n"
-                "金額の案内後、下に表示された別の「お支払い専用メニュー」から、お支払い方法を選択してください。"
-                if is_cheat else
-                "注文内容の入力が完了しました。\n下に表示された別の「お支払い専用メニュー」から、お支払い方法を選択してください。"
-            ),
-            color=COLOR_GLOW,
-        )
-        await interaction.response.edit_message(embed=intake_embed, view=None)
-        payment_embed, payment_view = render_panel(state)
-        payment_message = await safe_send(
-            channel,
-            f"<@{owner_id}> お支払い専用メニューです。",
-            embed=payment_embed,
-            view=payment_view,
-        )
+        state.setdefault("meta", {})["submitted_at"] = time.time()
+        payment_message = await _show(interaction, state, new_page=True)
         if payment_message is None:
-            await safe_send(channel, "⚠️ お支払い画面を作成できませんでした。スタッフにお知らせください。")
             return
         if is_cheat:
             # チートは料金が個別案内のため、相談内容はこの時点でスタッフへ通知する
@@ -2028,11 +2118,6 @@ async def handle_customer_action(interaction, parts):
         state["answers"]["payment"] = payment
         state["status"] = "submitted"
         await _show(interaction, state)
-        if payment == "ltc":
-            await safe_send(
-                channel,
-                f"<@{owner_id}> LTC送金先アドレスを表示しました。送金後、専用画面の「はい、送金しました」を押してください。",
-            )
         return
 
     if action == "copy":
@@ -2047,23 +2132,22 @@ async def handle_customer_action(interaction, parts):
         ):
             return await _ephemeral(interaction, "LTCを選択した注文でのみ、この操作を利用できます。")
         state["status"] = "reported"
-        await _show(interaction, state)
-        await notify_staff(interaction.guild, channel, message, state, "💸 入金報告がありました")
+        shown = await _show(interaction, state)
+        await notify_staff(interaction.guild, channel, shown or message, state, "💸 入金報告がありました")
         return
 
-    if action == "cancel":         # ord:cancel:<戻り先>
-        if state["status"] not in ("draft", "payment_select", "submitted"):
+    if action == "cancel":         # ord:cancel:<戻り先>（入力中の確認画面のみ）
+        if state["status"] != "draft":
             return await _ephemeral(
                 interaction,
-                "入金報告後のキャンセルはスタッフが対応します。このチャンネルでお知らせください。",
+                "注文確定後のキャンセルはスタッフが対応します。このチャンネルでお知らせください。",
             )
-        embed, view = render_cancel_confirm(state, parts[2])
-        await interaction.response.edit_message(embed=embed, view=view)
+        await _show_view(interaction, state, render_cancel_confirm(state, parts[2]))
         return
 
     if action == "cxn":            # キャンセルをやめて元の画面へ
         back_to = parts[2]
-        if back_to == "pay" or state["status"] != "draft":
+        if back_to in ("pay", "payment") or state["status"] != "draft":
             return await _show(interaction, state)
         return await _show(interaction, state, back_to)
 
@@ -2073,7 +2157,6 @@ async def handle_customer_action(interaction, parts):
             return await _ephemeral(interaction, "現在の状態ではキャンセルできません。")
         state["status"] = "cancelled"
         await _show(interaction, state)
-        # 代行のPayPayリンク入力待ち段階はスタッフへ未通知のため、取消通知も送らない。
         # チートは相談送信時点でスタッフへ通知済みのため、支払い前の取消も知らせる。
         if state["answers"].get("category") == "cheat":
             staff_knows = previous in ("payment_select", "submitted")
@@ -2091,7 +2174,7 @@ async def handle_customer_action(interaction, parts):
             await interaction.response.defer()
             await send_order_panel(channel, owner_id)
             return
-        return await _show(interaction, new_order_state(owner_id))
+        return await _show(interaction, new_order_state(owner_id), new_page=True)
 
     await _ephemeral(interaction, "不明な操作です。")
 
@@ -2166,10 +2249,17 @@ async def _fetch_ticket_panel(channel_id, message_id):
     if not is_ticket(channel):
         return channel, None
     try:
-        panel = await channel.fetch_message(message_id)
+        return channel, await channel.fetch_message(message_id)
     except discord.NotFound:
-        return channel, None
-    return channel, panel
+        pass
+    # 画面を出し直した注文は、今の画面を保存データから探す
+    entry = find_order_by_message(channel_id, message_id)
+    if entry and entry.get("message_id") != message_id:
+        try:
+            return channel, await channel.fetch_message(entry["message_id"])
+        except discord.NotFound:
+            pass
+    return channel, None
 
 
 def _paypay_link_input_allowed(state):
@@ -2310,6 +2400,7 @@ async def handle_customer_paypay_action(interaction, parts):
                         interaction,
                         "送金額の形式が正しくありません。スタッフからご案内した金額を数字で入力してください（例：`3000`）。",
                     )
+                state["answers"]["amount"] = price  # 実績に載せる金額として記録
             else:
                 price = order_quote(state)
             recipient_ids = paypay_recipient_ids(state)
@@ -2320,9 +2411,8 @@ async def handle_customer_paypay_action(interaction, parts):
             if state["status"] == "payment_select":
                 state["answers"]["payment"] = "paypay"
                 state["status"] = "submitted"
-                embed, view = render_panel(state)
                 try:
-                    await panel.edit(embed=embed, view=view)
+                    panel = await edit_panel(panel, state)
                 except discord.HTTPException as error:
                     log_http_error("PayPay選択の反映", error)
                     return await _ephemeral(interaction, "お支払い画面を更新できませんでした。もう一度お試しください。")
@@ -2404,9 +2494,8 @@ async def handle_customer_paypay_action(interaction, parts):
 
             # DM送信成功 → 受け取り確認待ち（スタッフへのメンションはしない）
             state["status"] = "link_sent"
-            embed, view = render_panel(state)
             try:
-                await panel.edit(embed=embed, view=view)
+                panel = await edit_panel(panel, state)
             except discord.HTTPException as error:
                 log_http_error("PayPay送信後の画面更新", error)
             await safe_send(
@@ -2473,9 +2562,8 @@ async def handle_customer_paypay_action(interaction, parts):
 
             # 段階3：受け取り確認済みへ
             state["status"] = "received"
-            embed, view = render_panel(state)
             try:
-                await panel.edit(embed=embed, view=view)
+                panel = await edit_panel(panel, state)
             except discord.HTTPException as error:
                 log_http_error("PayPay受け取り確認の反映", error)
                 return await _ephemeral(interaction, "チケットの更新に失敗しました。もう一度ボタンを押してください。")
@@ -2594,12 +2682,8 @@ async def handle_staff_action(interaction, parts):
     await interaction.response.defer()
 
     async with order_locks[message_id]:
-        channel = bot.get_channel(channel_id)
-        if channel is None:
-            channel = await bot.fetch_channel(channel_id)
-        try:
-            panel = await channel.fetch_message(message_id)
-        except discord.NotFound:
+        channel, panel = await _fetch_ticket_panel(channel_id, message_id)
+        if panel is None:
             await _ephemeral(interaction, "受付パネルが見つかりません（削除された可能性があります）。")
             return
 
@@ -2629,8 +2713,18 @@ async def handle_staff_action(interaction, parts):
             )
         else:
             state["status"] = new_status
-            embed, view = render_panel(state)
-            await panel.edit(embed=embed, view=view)
+            if new_status == "done":
+                # 進み具合の画面を消して、完了の画面を出す（実績へのコメント待ちを始める）
+                now = time.time()
+                state.setdefault("meta", {})["done_at"] = now
+                state["meta"]["review"] = {"status": "pending", "last_remind": now}
+                new_panel = await repost_panel(channel, panel, state)
+                if new_panel is None:
+                    await _ephemeral(interaction, "完了画面を出せませんでした。もう一度お試しください。")
+                    return
+                panel = new_panel
+            else:
+                panel = await edit_panel(panel, state)
 
             owner = f"<@{state['owner_id']}>" if state.get("owner_id") else ""
             is_cheat = state["answers"].get("category") == "cheat"
@@ -2642,10 +2736,10 @@ async def handle_staff_action(interaction, parts):
                     if is_cheat else
                     f"{owner} 入金を確認しました。代行を開始します！"
                 ),
-                "done": f"{owner} ご依頼が完了しました。ご利用ありがとうございました！",
                 "cancelled": f"{owner} ご注文 `#{state['order_id']}` はスタッフによりキャンセルされました。",
             }
-            await safe_send(channel, notices[new_status])
+            if new_status in notices:  # 完了は完了画面でお知らせする
+                await safe_send(channel, notices[new_status])
             logger.info(
                 "注文 #%s を %s に変更 (staff=%s)",
                 state["order_id"], new_status, interaction.user.id,
@@ -2654,7 +2748,7 @@ async def handle_staff_action(interaction, parts):
         title = interaction.message.embeds[0].title if interaction.message.embeds else "注文"
         await interaction.edit_original_response(
             embed=build_staff_embed(state, channel, title, panel.jump_url, interaction.user),
-            view=staff_view(state, channel_id, message_id),
+            view=staff_view(state, channel_id, panel.id),
         )
 
 
@@ -2677,6 +2771,9 @@ async def on_order_interaction(interaction):
             return
         if parts[1] == "s":
             await handle_staff_action(interaction, parts)
+            return
+        if parts[1] == "delete":
+            await handle_order_delete(interaction)
             return
 
         lock_key = interaction.message.id if interaction.message else interaction.channel_id
@@ -2790,23 +2887,8 @@ async def open_ticket(interaction, order_category=None):
                 # 通知に失敗してもチケットの初期化（ウェルカム・受付パネル）は続ける
                 log_http_error("チケット作成の完了通知", error)
 
-            welcome = discord.Embed(
-                title="お問い合わせありがとうございます",
-                description=(
-                    "下の **受付パネル** のボタンを順番に選ぶだけで、ご注文が完了します。\n"
-                    "料金は料金表に基づいて自動で計算されます。\n\n"
-                    "◆ 内容の変更・戻る・キャンセルはいつでも可能です\n"
-                    "◆ パネルはご本人様のみ操作できます\n"
-                    "◆ 料金表にないご相談はスタッフが個別に対応します"
-                ),
-                color=COLOR_DEEP,
-            )
-            welcome.set_author(name=f"◆ {BRAND_NAME}　｜　SUPPORT")
-            await channel.send(
-                f"{user.mention}",
-                embed=welcome,
-                view=OpenTicketView(),
-            )
+            # 「ようこそ」はステップが進んでも消さずに残す
+            await channel.send(view=render_welcome(user), allowed_mentions=PANEL_MENTIONS)
             await send_order_panel(channel, user.id, order_category)
 
         except discord.HTTPException as error:
@@ -2827,10 +2909,10 @@ async def open_ticket(interaction, order_category=None):
 # 上部の動画（RSGYの紹介動画をGIFにしたもの。GIFはDiscordで自動再生される）。黒・アイボリー・シャンパンゴールドの雰囲気に合わせる
 TICKET_BANNER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "ticket_banner.gif")
 TICKET_BANNER_FILENAME = "ticket_banner.gif"
-COLOR_CHAMPAGNE = 0xB89A6A
 
 TICKET_MENU_OPTIONS = [
-    ("boost", "代行", "⚔️", "トロ上げ・ガチバ／料金は自動計算"),
+    ("trophy", "トロ上げ代行", "🏆", f"¥{min(TROPHY_PRICES.values()):,}〜／料金は自動計算"),
+    ("ranked", "ガチバ代行", "⚔️", f"¥{min(RANK_PRICES.values()):,}〜／料金は自動計算"),
     ("cheat", "チート", "🗝️", "スタッフが個別にご案内します"),
     ("middle", "仲介", "🤝", f"お取引の仲介／手数料 ¥{MIDDLE_FEE:,}"),
 ]
@@ -2917,7 +2999,7 @@ async def on_ticket_panel_interaction(interaction):
         if custom_id == "tp:menu":
             values = (interaction.data or {}).get("values") or []
             order_category = values[0] if values else None
-            if order_category not in CATEGORY_LABELS:
+            if order_category not in MENU_CHOICES:
                 await _ephemeral(interaction, "不正な選択です。")
                 return
             await open_ticket(interaction, order_category)
@@ -3040,6 +3122,7 @@ class ClosedTicketView(discord.ui.View):
             return
 
         await interaction.response.send_message("チケットを削除します。")
+        await finalize_reviews_for_channel(interaction.channel.id)
         await interaction.channel.delete()
 
 
@@ -3177,6 +3260,198 @@ async def silent_ticket_loop():
         except Exception as error:
             log_unexpected_error("無言チケットの巡回", error)
         await asyncio.sleep(SILENT_CHECK_INTERVAL)
+
+
+# ==========================================
+# 15-3. 実績（完了した注文の掲載・コメントの催促）
+# ==========================================
+
+def build_review_modal():
+    modal = discord.ui.Modal(title="実績へのコメント", custom_id="ord:modal:review:n", timeout=900)
+    modal.add_item(discord.ui.Label(
+        text="コメント",
+        description="ご利用の感想をお聞かせください。実績チャンネルに載ります。",
+        component=discord.ui.TextInput(
+            custom_id="comment",
+            style=discord.TextStyle.paragraph,
+            placeholder="例：早く丁寧に対応してもらえました！",
+            required=True,
+            max_length=300,
+        ),
+    ))
+    modal.add_item(discord.ui.Label(
+        text="名前を伏せますか？",
+        component=discord.ui.Select(
+            custom_id="anon",
+            placeholder="選んでください",
+            options=[
+                discord.SelectOption(label="はい（名前を伏せる）", value="yes", emoji="🙈"),
+                discord.SelectOption(label="いいえ（名前を出して大丈夫）", value="no", emoji="🙆"),
+            ],
+        ),
+    ))
+    return modal
+
+
+def _format_duration(seconds):
+    if seconds is None or seconds < 0:
+        return "―"
+    hours = max(1, round(seconds / 3600))
+    if hours < 48:
+        return f"約{hours}時間"
+    return f"約{round(seconds / 86400)}日"
+
+
+def build_jisseki_view(state, comment=None, anonymous=False):
+    meta = state.get("meta", {})
+    amount = order_amount(state)
+    submitted_at, done_at = meta.get("submitted_at"), meta.get("done_at")
+    duration = done_at - submitted_at if (submitted_at and done_at) else None
+    answers = state["answers"]
+    if answers.get("category") == "middle":
+        detail = "お取引の仲介"
+    else:
+        detail = _range_text(state)
+    name = "匿名のお客様" if anonymous else f"<@{state['owner_id']}>"
+    if comment:
+        comment_text = "\n".join(f"> {line}" for line in comment.splitlines() if line.strip())
+    else:
+        comment_text = "-# コメントなし"
+    done_date = datetime.fromtimestamp(done_at or time.time(), timezone.utc).astimezone()
+    return _layout(
+        _head("-# RSGY　/　実績", f"## {order_title(state)}", detail or None),
+        _sep(),
+        _text(
+            f"金額　**{f'¥{amount:,}' if amount else '―'}**\n"
+            f"期間　**{_format_duration(duration)}**\n"
+            f"お客様　**{name}**"
+        ),
+        _sep(),
+        _text(comment_text),
+        _text(f"-# {done_date:%Y/%m/%d} 完了"),
+    )
+
+
+async def post_jisseki(state, comment=None, anonymous=False):
+    channel = bot.get_channel(JISSEKI_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(JISSEKI_CHANNEL_ID)
+        except discord.HTTPException as error:
+            log_http_error("実績チャンネルの取得", error)
+            return False
+    try:
+        await channel.send(
+            view=build_jisseki_view(state, comment, anonymous),
+            allowed_mentions=discord.AllowedMentions(users=not anonymous, roles=False, everyone=False),
+        )
+    except discord.HTTPException as error:
+        log_http_error("実績の投稿", error)
+        return False
+    logger.info("実績を掲載: #%s（匿名=%s・コメント=%s）", state["order_id"], anonymous, bool(comment))
+    return True
+
+
+async def finalize_review(order_id, comment=None, anonymous=False):
+    """実績を掲載して、注文を「掲載済み」にする。完了画面が残っていれば書き換える。"""
+    entry = load_order(order_id)
+    if entry is None:
+        return False
+    state = copy.deepcopy(entry["state"])
+    review = state.setdefault("meta", {}).setdefault("review", {})
+    if state["status"] != "done" or review.get("status") == "posted":
+        return False
+    if not await post_jisseki(state, comment, anonymous):
+        return False
+    review.update({"status": "posted", "posted_at": time.time(), "anonymous": anonymous, "comment": bool(comment)})
+    save_order(state, entry["channel_id"], entry["message_id"])
+    channel = bot.get_channel(entry["channel_id"])
+    if channel is not None:
+        try:
+            message = await channel.fetch_message(entry["message_id"])
+            await edit_panel(message, state)
+        except discord.HTTPException:
+            pass  # 完了画面がなくても掲載はできている
+    return True
+
+
+async def submit_review(interaction, state, values):
+    comment = clean_text(values.get("comment"), 300)
+    anon = values.get("anon")
+    if not comment:
+        return await _ephemeral(interaction, "コメントを入力してください。")
+    if anon not in ("yes", "no"):
+        return await _ephemeral(interaction, "名前を伏せるかどうかを選んでください。")
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    if await finalize_review(state["order_id"], comment, anonymous=anon == "yes"):
+        await interaction.followup.send("実績に掲載しました。ありがとうございました！", ephemeral=True)
+    else:
+        await interaction.followup.send("実績に掲載できませんでした。時間をおいてもう一度お試しください。", ephemeral=True)
+
+
+async def finalize_reviews_for_channel(channel_id):
+    """チケットを消す前に、コメント待ちの実績を（コメントなし・名前ありで）掲載する。"""
+    for order_id, entry in list(_load_order_store().items()):
+        state = entry.get("state", {})
+        if (entry.get("channel_id") == channel_id and state.get("status") == "done"
+                and state.get("meta", {}).get("review", {}).get("status") == "pending"):
+            await finalize_review(order_id)
+
+
+async def check_pending_reviews():
+    now = time.time()
+    for order_id, entry in list(_load_order_store().items()):
+        state = copy.deepcopy(entry.get("state", {}))
+        review = state.get("meta", {}).get("review", {})
+        if state.get("status") != "done" or review.get("status") != "pending":
+            continue
+        done_at = state["meta"].get("done_at", now)
+        if now - done_at >= REVIEW_DEADLINE_HOURS * 3600:
+            await finalize_review(order_id)
+            continue
+        if now - review.get("last_remind", done_at) < REVIEW_REMIND_SECONDS:
+            continue
+        channel = bot.get_channel(entry["channel_id"])
+        if channel is None:
+            # チケットが消えている場合は、その場で掲載する
+            await finalize_review(order_id)
+            continue
+        remaining = max(1, round((done_at + REVIEW_DEADLINE_HOURS * 3600 - now) / 3600))
+        await safe_send(
+            channel,
+            f"<@{state['owner_id']}> 実績へのコメントをお願いします！\n"
+            "完了画面の「✍️ 実績にコメントする」から書けます（名前を伏せることもできます）。\n"
+            f"-# あと約{remaining}時間で、コメントなし・お名前ありで実績に載ります。",
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
+        review["last_remind"] = now
+        save_order(state, entry["channel_id"], entry["message_id"])
+
+
+async def review_reminder_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            await check_pending_reviews()
+        except Exception as error:
+            log_unexpected_error("実績コメントの催促", error)
+        await asyncio.sleep(REVIEW_CHECK_INTERVAL)
+
+
+async def handle_order_delete(interaction):
+    """完了画面の「チケットを削除」。注文したお客様本人とスタッフが押せる。"""
+    channel = interaction.channel
+    message = interaction.message
+    state = parse_order_message(message)
+    if state is None or not is_ticket(channel):
+        return await _ephemeral(interaction, "受付データを読み込めませんでした。")
+    is_owner = interaction.user.id == state["owner_id"]
+    if not (is_staff(interaction.user) or (is_owner and state["status"] == "done")):
+        return await _ephemeral(interaction, "このチケットを削除する権限がありません。")
+    await interaction.response.send_message("チケットを削除します。")
+    await finalize_reviews_for_channel(channel.id)
+    await asyncio.sleep(2)
+    await channel.delete(reason=f"完了したチケットを削除（{interaction.user}）")
 
 
 # ==========================================
