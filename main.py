@@ -10,7 +10,7 @@ import threading
 import time
 import traceback
 import unicodedata
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 
 import discord
@@ -19,6 +19,8 @@ from flask import Flask
 from waitress import serve
 
 from anti_nuke import setup_anti_nuke
+import cheat_guide
+import ai_support
 
 
 # ==========================================
@@ -699,6 +701,7 @@ FIELD_LABELS = {
     "device": "端末",
     "detail": "相談内容",
     "partner": "取引相手",
+    "product": "商品",
 }
 LABEL_TO_KEY = {v: k for k, v in FIELD_LABELS.items()}
 
@@ -741,7 +744,7 @@ def step_sequence(state):
     answers = state["answers"]
     seq = ["category"]
     if answers.get("category") == "cheat":
-        seq += ["device", "detail"]
+        seq += ["product", "device"]
     elif answers.get("category") == "middle":
         seq += ["partner"]
     elif answers.get("category") == "boost":
@@ -786,6 +789,8 @@ def step_done(state, step):
         return answers.get("device") in DEVICE_LABELS
     if step == "detail":
         return bool(answers.get("detail"))
+    if step == "product":
+        return answers.get("product") in cheat_guide.PRODUCTS
     if step == "partner":
         return partner_id_from(answers.get("partner")) is not None
     return True
@@ -871,6 +876,9 @@ def display_value(state, key):
         return SERVICE_LABELS.get(value)
     if key == "device":
         return DEVICE_LABELS.get(value)
+    if key == "product":
+        product = cheat_guide.PRODUCTS.get(value)
+        return product["label"] if product else None
     if key == "payment":
         return PAYMENT_LABELS.get(value)
     if key in ("start", "goal"):
@@ -903,7 +911,7 @@ def summary_keys(state):
     answers = state["answers"]
     category = answers.get("category")
     if category == "cheat":
-        return ["category", "device", "detail", "payment"]
+        return ["category", "product", "device", "detail", "payment"]
     if category == "middle":
         return ["category", "partner", "payment"]
     if category == "boost":
@@ -1113,6 +1121,7 @@ STEP_LABELS = {
     "device": "ご利用端末",
     "detail": "ご相談内容",
     "partner": "取引相手",
+    "product": "商品",
     "confirm": "最終確認",
     "payment": "お支払い",
 }
@@ -1187,8 +1196,13 @@ def _range_text(state):
             return f"{start} → {goal}"
     if category == "middle" and answers.get("partner"):
         return f"取引相手：{PARTNER_ID_RE.sub('', answers['partner'])}"
-    if category == "cheat" and answers.get("device"):
-        return f"端末：{display_value(state, 'device')}"
+    if category == "cheat" and (answers.get("product") or answers.get("device")):
+        parts = []
+        if answers.get("product"):
+            parts.append(f"商品：{display_value(state, 'product')}")
+        if answers.get("device"):
+            parts.append(f"端末：{display_value(state, 'device')}")
+        return "　".join(parts)
     return None
 
 
@@ -1196,6 +1210,8 @@ def order_title(state):
     answers = state["answers"]
     if answers.get("category") == "boost":
         return SERVICE_LABELS.get(answers.get("service"), "代行")
+    if answers.get("category") == "cheat" and answers.get("product"):
+        return f"チート（{display_value(state, 'product')}）"
     return CATEGORY_LABELS.get(answers.get("category"), "ご注文")
 
 
@@ -1208,7 +1224,7 @@ def order_amount(state):
 def _summary_lines(state):
     lines = []
     for key in summary_keys(state):
-        if key in ("payment", "category", "service"):
+        if key in ("payment", "category", "service", "product"):
             continue
         text = display_value(state, key)
         if key == "partner" and text:
@@ -1301,6 +1317,21 @@ def render_step(state, step, ret="n"):
         items.append(_row(_btn("入力内容を修正する" if done else "情報を入力する", f"ord:open:info:{ret}",
                                style=discord.ButtonStyle.secondary if done else discord.ButtonStyle.primary, emoji="📝")))
         nav_next = done
+
+    elif step == "product":
+        items.append(_head(_kicker(state), _step_line(state, step), f"## {prefix}商品を選んでください"))
+        items.append(_sep())
+        current = answers.get("product")
+        items.append(_row(discord.ui.Select(
+            custom_id=f"ord:sel:product:{ret}",
+            placeholder="商品を選択",
+            options=[
+                discord.SelectOption(label=p["label"], value=key, emoji=p["emoji"],
+                                     description=p["description"], default=current == key)
+                for key, p in cheat_guide.PRODUCTS.items()
+            ],
+        )))
+        items.append(_text("-# 料金（証明書を含む）はスタッフが個別にご案内します。チート本体はご自身で購入していただきます"))
 
     elif step == "device":
         items.append(_head(_kicker(state), _step_line(state, step), f"## {prefix}ご利用の端末を選んでください"))
@@ -1635,6 +1666,90 @@ async def handle_account_action(interaction, state, kind, submitted):
         allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
     )
     logger.info("認証コードを受付: #%s", state["order_id"])
+
+
+def update_order(state):
+    """画面（メッセージ）の場所は変えずに、注文の中身だけ保存し直す。"""
+    entry = load_order(state["order_id"])
+    if entry:
+        save_order(state, entry["channel_id"], entry["message_id"])
+
+
+def render_guide(state, *, mention=False):
+    """チートの導入の案内（1ステップ分）。"""
+    guide = state.get("meta", {}).get("guide", {})
+    steps = cheat_guide.guide_steps(state["answers"].get("product"))
+    idx = min(guide.get("step", 0), len(steps) - 1)
+    step = steps[idx]
+    dots = "◆" * (idx + 1) + "◇" * (len(steps) - idx - 1)
+    items = [
+        _head(_kicker(state), f"**導入 {idx + 1} / {len(steps)}**　{dots}", f"## {step['title']}"),
+        _sep(),
+        _text(step["body"]),
+    ]
+    if step["links"]:
+        items.append(_row(*[
+            discord.ui.Button(label=label, url=url, style=discord.ButtonStyle.link)
+            for label, url in step["links"]
+        ]))
+    items.append(_sep())
+    if guide.get("finished"):
+        items.append(_text("### 🎉 導入お疲れさまでした！\nスタッフが確認して、注文を完了にします。"))
+    else:
+        items.append(_row(
+            _btn("戻る", "ord:guide:back", emoji="◀️", disabled=idx == 0),
+            _btn("できた", "ord:guide:next", style=discord.ButtonStyle.success, emoji="✅"),
+            _btn("うまくいかない", "ord:guide:help", emoji="🆘"),
+        ))
+        items.append(_text("-# 分からないことは、このチャンネルにそのまま書き込んでください。AIかスタッフがお答えします"))
+    items.append(_footer(state))
+    return _layout(*items, outside=f"<@{state['owner_id']}>" if mention else None)
+
+
+async def handle_guide_action(interaction, state, action):
+    guide = state.get("meta", {}).get("guide")
+    if state["status"] != "paid" or guide is None:
+        return await _ephemeral(interaction, "現在、導入の案内は行っていません。")
+    steps = cheat_guide.guide_steps(state["answers"].get("product"))
+    idx = guide.get("step", 0)
+    channel = interaction.channel
+    if action == "help":
+        await interaction.response.send_message("スタッフを呼びました。少しお待ちください。", ephemeral=True)
+        await safe_send(
+            channel,
+            f"🆘 <@{state['owner_id']}> さんが「{steps[min(idx, len(steps) - 1)]['title']}」でつまずいています。"
+            f"　{staff_mentions(channel.guild)}",
+            allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+        )
+        return
+    if action == "back":
+        guide["step"] = max(0, idx - 1)
+    elif action == "next":
+        if idx >= len(steps) - 1:
+            guide["finished"] = True
+        else:
+            guide["step"] = idx + 1
+    else:
+        return await _ephemeral(interaction, "不明な操作です。")
+    update_order(state)
+    # 前のステップの画面を消して、次のステップを出す
+    await interaction.response.defer()
+    try:
+        await channel.send(view=render_guide(state), allowed_mentions=PANEL_MENTIONS)
+    except discord.HTTPException as error:
+        log_http_error("導入の案内の送信", error)
+        return await _ephemeral(interaction, "画面を更新できませんでした。もう一度お試しください。")
+    try:
+        await interaction.message.delete()
+    except discord.HTTPException as error:
+        log_http_error("前の導入の案内の削除", error)
+    if guide.get("finished"):
+        await safe_send(
+            channel,
+            f"✅ <@{state['owner_id']}> さんの導入が終わりました。確認して「完了」を押してください。"
+            f"　{staff_mentions(channel.guild)}",
+            allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+        )
 
 
 def render_cancel_confirm(state, back_to):
@@ -2060,6 +2175,8 @@ async def handle_customer_action(interaction, parts):
     action = parts[1]
     if action in ("acct", "acctm"):     # ログイン情報の入力（代行の対応中）
         return await handle_account_action(interaction, state, parts[2] if len(parts) > 2 else "", action == "acctm")
+    if action == "guide":               # チートの導入の案内
+        return await handle_guide_action(interaction, state, parts[2] if len(parts) > 2 else "")
     is_review = action in ("open", "modal") and len(parts) > 2 and parts[2] == "review"
 
     if not is_review and _ticket_closed_for(channel, owner_id):
@@ -2092,6 +2209,11 @@ async def handle_customer_action(interaction, parts):
                 return await _ephemeral(interaction, "不正な選択です。")
             apply_menu_choice(state, values[0])
             return await _show(interaction, state, first_incomplete(state), "n", new_page=True)
+        if key == "product":
+            if values[0] not in cheat_guide.PRODUCTS:
+                return await _ephemeral(interaction, "不正な選択です。")
+            state["answers"]["product"] = values[0]
+            return await _show_after_answer(interaction, state, "product", ret)
         if key not in ("start", "goal"):
             return await _ephemeral(interaction, "不正な選択です。")
         try:
@@ -2753,6 +2875,13 @@ async def apply_status_change(channel, panel, state, new_status):
         if is_boost:
             # 代行はログインに必要なメールアドレスと認証コードをお願いする
             await channel.send(view=render_account_request(state), allowed_mentions=PANEL_MENTIONS)
+        elif state["answers"].get("category") == "cheat" and state["answers"].get("product") in cheat_guide.PRODUCTS:
+            # チートは導入の案内を始める（最初はスタッフが証明書を送るのを待つ）
+            state.setdefault("meta", {})["guide"] = {"step": 0, "finished": False}
+            update_order(state)
+            await channel.send(view=render_guide(state, mention=True), allowed_mentions=PANEL_MENTIONS)
+            await notify_staff(channel.guild, channel, panel, state,
+                               "🗝️ 入金を確認しました。証明書を用意して、このチケットに送ってください。")
         else:
             await safe_send(channel, f"{owner} 入金を確認しました。対応を開始します！")
             await notify_staff(channel.guild, channel, panel, state, "✅ 入金を確認しました。対応をお願いします。")
@@ -3566,6 +3695,155 @@ async def handle_order_delete(interaction):
 
 
 # ==========================================
+# 15-4. チケット内のAI返答
+# ==========================================
+
+AI_MAX_PER_HOUR = 10            # 1人あたり1時間に答える回数
+AI_STAFF_QUIET_MINUTES = 15     # スタッフがこの時間内に書き込んでいたら、AIは答えない
+AI_HISTORY_MESSAGES = 12        # AIに渡す直近のメッセージ数
+AI_STAFF_MARK = "[STAFF]"
+
+ai_usage = defaultdict(deque)
+ai_busy_channels = set()
+_EMAIL_IN_TEXT_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+_CODE_IN_TEXT_RE = re.compile(r"(?<!\d)\d{6}(?!\d)")
+
+
+def _mask_private(text):
+    """メールアドレスと認証コードらしき数字は、AIに渡さない。"""
+    text = _EMAIL_IN_TEXT_RE.sub("［メールアドレス］", text or "")
+    text = PAYPAY_URL_RE.sub("［PayPayリンク］", text)
+    return _CODE_IN_TEXT_RE.sub("［コード］", text)
+
+
+def _latest_order_in_channel(channel_id):
+    entries = [e for e in _load_order_store().values() if e.get("channel_id") == channel_id]
+    if not entries:
+        return None
+    return max(entries, key=lambda e: e.get("updated", 0))["state"]
+
+
+def build_ai_system_prompt(state):
+    if state:
+        amount = order_amount(state)
+        guide = state.get("meta", {}).get("guide")
+        order_lines = [
+            f"種類：{order_title(state)}",
+            f"内容：{_range_text(state) or 'なし'}",
+            f"状態：{STATUS_TEXT.get(state['status'], state['status'])}",
+            f"金額：{f'¥{amount:,}' if amount else 'スタッフが案内'}",
+        ]
+        if guide:
+            steps = cheat_guide.guide_steps(state["answers"].get("product"))
+            idx = min(guide.get("step", 0), len(steps) - 1)
+            order_lines.append(f"チートの導入：{idx + 1}/{len(steps)}「{steps[idx]['title']}」" + ("（完了）" if guide.get("finished") else ""))
+        order_text = "\n".join(order_lines)
+    else:
+        order_text = "まだ注文はありません。"
+    return f"""あなたは Discord サーバー「RSGY」のサポート担当です。お客様専用のチケットの中で、お客様の質問に答えます。
+
+# 話し方
+- 丁寧で親しみやすい日本語。短く分かりやすく（3〜6文ほど。手順は箇条書き）。
+- お店の立場で、お客様が迷わず進めるように案内する。
+
+# 守ること
+- このサーバーのサービスと、下に書かれた情報だけで答える。書かれていないことは推測で答えない。
+- 料金は下の料金表のとおり。チートの料金（証明書を含む）はスタッフが個別に案内する。値引き・返金・完了日の約束はしない。
+- 返金、トラブル、クレーム、料金の交渉、下の情報にない質問、何度説明しても解決しないときは「スタッフをお呼びしますね」と伝え、返事の最後に {AI_STAFF_MARK} と書く。
+- パスワードは絶対に聞かない。メールアドレスと認証コードは、チャットに書かずに画面の専用ボタンから入力するよう案内する。
+- PayPayリンクはチャットに貼らず、お支払い画面のフォームから送るよう案内する。
+- AIかどうか聞かれたら、AIの自動返信だと正直に答える。
+
+# サービス
+- トロ上げ代行・ガチバ代行：料金は自動計算。お支払いのあと「対応中」になったら、メールアドレスを入力し、スタッフがログインしたら届いた認証コードを入力してもらう。
+- チート（bs・bsクラック・tale）：料金（証明書を含む）はスタッフが個別に案内。お支払いのあとスタッフが証明書を用意し、チート本体はお客様が自分で購入して、署名サイトでアプリ化する。
+- 仲介：手数料 ¥{MIDDLE_FEE:,}（PayPayのみ）。お支払い後、取引相手がチケットに入り、スタッフが対応する。
+- 注文の流れ：チケットで内容を選ぶ → 最終確認 → お支払い（PayPay か LTC）→ 入金確認 → 対応中 → 完了 → 実績へのコメント。
+
+# 料金表
+{price_table_text()}
+
+# チートの導入手順
+{cheat_guide.guide_text_for_ai()}
+
+# このお客様の注文
+{order_text}
+"""
+
+
+async def answer_ticket_question(message):
+    channel = message.channel
+    owner_id = get_ticket_owner(channel)
+    if channel.id in ai_busy_channels:
+        return
+    content = (message.content or "").strip()
+    if not content or content.startswith("!"):
+        return
+
+    # スタッフが対応中なら、AIは口を出さない
+    since = datetime.now(timezone.utc).timestamp() - AI_STAFF_QUIET_MINUTES * 60
+    history = []
+    async for past in channel.history(limit=AI_HISTORY_MESSAGES, before=message):
+        if past.created_at.timestamp() >= since and not past.author.bot and is_staff(past.author):
+            return
+        history.append(past)
+
+    now = time.time()
+    usage = ai_usage[owner_id]
+    while usage and now - usage[0] > 3600:
+        usage.popleft()
+    if len(usage) >= AI_MAX_PER_HOUR:
+        return
+    usage.append(now)
+
+    turns = []
+    for past in reversed(history):
+        text = (past.content or "").strip()
+        if not text:
+            continue
+        if past.author.id == bot.user.id:
+            turns.append(("assistant", text.replace(AI_STAFF_MARK, "")))
+        elif past.author.id == owner_id:
+            turns.append(("user", _mask_private(text)))
+    turns.append(("user", _mask_private(content)))
+    # 同じ話し手が続く場合はまとめ、最初はお客様の発言から始める
+    merged = []
+    for role, text in turns:
+        if merged and merged[-1][0] == role:
+            merged[-1] = (role, merged[-1][1] + "\n" + text)
+        else:
+            merged.append((role, text))
+    while merged and merged[0][0] != "user":
+        merged.pop(0)
+
+    ai_busy_channels.add(channel.id)
+    try:
+        async with channel.typing():
+            answer = await ai_support.ask_ai(build_ai_system_prompt(_latest_order_in_channel(channel.id)), merged)
+    except Exception as error:
+        log_unexpected_error("AIの返答", error)
+        answer = None
+    finally:
+        ai_busy_channels.discard(channel.id)
+    if not answer:
+        return
+
+    call_staff = AI_STAFF_MARK in answer
+    answer = answer.replace(AI_STAFF_MARK, "").strip()[:1700]
+    footer = "\n-# 🤖 AIの自動返信です"
+    if call_staff:
+        footer = f"\n{staff_mentions(channel.guild)}" + footer
+    try:
+        await message.reply(
+            answer + footer,
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions(roles=call_staff, users=False, everyone=False),
+        )
+    except discord.HTTPException as error:
+        log_http_error("AIの返答の送信", error)
+
+
+# ==========================================
 # 16. 起動・接続イベント
 # ==========================================
 
@@ -3641,6 +3919,15 @@ async def on_message(message):
         except discord.HTTPException as error:
             log_http_error("PayPayリンクを含むメッセージの削除", error)
         return
+
+    # チケットの中で、お客様本人の書き込みにはAIが答える
+    if (not message.author.bot
+            and is_ticket(message.channel)
+            and message.author.id == get_ticket_owner(message.channel)
+            and not is_staff(message.author)
+            and ai_support.ai_enabled()):
+        asyncio.create_task(answer_ticket_question(message))
+
     await bot.process_commands(message)
 
 
