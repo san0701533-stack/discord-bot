@@ -223,7 +223,7 @@ REVIEW_REMIND_SECONDS = 3600                 # コメントを催促する間隔
 REVIEW_CHECK_INTERVAL = 300                  # 催促・自動掲載を確認する間隔
 
 # ---- コマンドを使える人 ----
-# !setup_ticket・!order_panel・/nuke対策 はこのユーザーだけが使える
+# !setup_ticket・!order_panel・!ai_memory・!ai_forget・/nuke対策 はこのユーザーだけが使える
 COMMAND_OWNER_ID = 1462791798891090084
 
 # ---- Nuke対策 ----
@@ -1715,6 +1715,8 @@ async def handle_guide_action(interaction, state, action):
     channel = interaction.channel
     if action == "help":
         await interaction.response.send_message("スタッフを呼びました。少しお待ちください。", ephemeral=True)
+        product = display_value(state, "product") or "チート"
+        record_escalation(channel.id, f"{product}の導入の「{steps[min(idx, len(steps) - 1)]['title']}」のステップでうまくいかない")
         await safe_send(
             channel,
             f"🆘 <@{state['owner_id']}> さんが「{steps[min(idx, len(steps) - 1)]['title']}」でつまずいています。"
@@ -3698,6 +3700,104 @@ async def handle_order_delete(interaction):
 # 15-4. チケット内のAI返答
 # ==========================================
 
+# ---- AIが分からなかった質問と、スタッフの答えを覚える ----
+
+AI_KNOWLEDGE_PATH = os.path.join(BASE_DIR, "data", "ai_knowledge.json")
+AI_LEARN_WAIT_HOURS = 24        # 呼び出してからこの時間内のスタッフの返事を覚える
+AI_LEARN_WINDOW_MINUTES = 30    # 最初の返事からこの時間内の返事は、同じ答えとしてまとめる
+AI_KNOWLEDGE_IN_PROMPT = 15     # 前提に入れる件数（質問に近いものから）
+
+_ai_knowledge = None
+
+
+def _load_knowledge():
+    global _ai_knowledge
+    if _ai_knowledge is None:
+        try:
+            with open(AI_KNOWLEDGE_PATH, encoding="utf-8") as f:
+                _ai_knowledge = json.load(f)
+        except FileNotFoundError:
+            _ai_knowledge = {}
+        except (OSError, ValueError) as error:
+            logger.error("AIの学習データの読み込みに失敗しました: %s", error)
+            _ai_knowledge = {}
+        _ai_knowledge.setdefault("entries", [])
+        _ai_knowledge.setdefault("pending", {})
+        _ai_knowledge.setdefault("next_id", 1)
+    return _ai_knowledge
+
+
+def _save_knowledge():
+    data = _load_knowledge()
+    try:
+        os.makedirs(os.path.dirname(AI_KNOWLEDGE_PATH), exist_ok=True)
+        tmp = AI_KNOWLEDGE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, AI_KNOWLEDGE_PATH)
+    except OSError as error:
+        logger.error("AIの学習データの保存に失敗しました: %s", error)
+
+
+def record_escalation(channel_id, question):
+    """AIが答えられずスタッフを呼んだ質問を、スタッフの返事待ちとして記録する。"""
+    question = (question or "").strip()[:500]
+    if not question:
+        return
+    data = _load_knowledge()
+    data["pending"][str(channel_id)] = {"q": question, "at": time.time()}
+    _save_knowledge()
+
+
+def learn_from_staff(message):
+    """スタッフの返事を、直前に呼ばれた質問の答えとして覚える。"""
+    text = _mask_private((message.content or "").strip())
+    if len(text) < 2:
+        return
+    data = _load_knowledge()
+    pending = data["pending"].get(str(message.channel.id))
+    if not pending:
+        return
+    now = time.time()
+    if now - pending["at"] > AI_LEARN_WAIT_HOURS * 3600:
+        data["pending"].pop(str(message.channel.id), None)
+        _save_knowledge()
+        return
+    entry_id = pending.get("entry_id")
+    entry = next((e for e in data["entries"] if e["id"] == entry_id), None) if entry_id else None
+    if entry is not None and now - entry["at"] > AI_LEARN_WINDOW_MINUTES * 60:
+        data["pending"].pop(str(message.channel.id), None)
+        _save_knowledge()
+        return
+    if entry is None:
+        entry = {"id": data["next_id"], "q": pending["q"], "a": text, "at": now, "by": message.author.id}
+        data["next_id"] += 1
+        data["entries"].append(entry)
+        pending["entry_id"] = entry["id"]
+        logger.info("AIが学習しました: #%s", entry["id"])
+    else:
+        entry["a"] = (entry["a"] + "\n" + text)[:1500]
+    _save_knowledge()
+
+
+def _bigrams(text):
+    text = re.sub(r"\s", "", (text or "").lower())
+    return {text[i:i + 2] for i in range(len(text) - 1)}
+
+
+def knowledge_for_prompt(question):
+    entries = _load_knowledge()["entries"]
+    if not entries:
+        return "まだありません。"
+    q = _bigrams(question)
+    ranked = sorted(
+        entries,
+        key=lambda e: (len(q & _bigrams(e["q"] + e["a"])), e["at"]),
+        reverse=True,
+    )[:AI_KNOWLEDGE_IN_PROMPT]
+    return "\n".join(f"- 質問：{e['q'][:200]}\n  スタッフの答え：{e['a'][:400]}" for e in ranked)
+
+
 AI_MAX_PER_HOUR = 10            # 1人あたり1時間に答える回数
 AI_STAFF_QUIET_MINUTES = 15     # スタッフがこの時間内に書き込んでいたら、AIは答えない
 AI_HISTORY_MESSAGES = 12        # AIに渡す直近のメッセージ数
@@ -3723,7 +3823,7 @@ def _latest_order_in_channel(channel_id):
     return max(entries, key=lambda e: e.get("updated", 0))["state"]
 
 
-def build_ai_system_prompt(state):
+def build_ai_system_prompt(state, question=""):
     if state:
         amount = order_amount(state)
         guide = state.get("meta", {}).get("guide")
@@ -3765,6 +3865,9 @@ def build_ai_system_prompt(state):
 
 # チートの導入手順
 {cheat_guide.guide_text_for_ai()}
+
+# スタッフが過去に答えた内容（同じような質問には、これに沿って答える）
+{knowledge_for_prompt(question)}
 
 # このお客様の注文
 {order_text}
@@ -3819,7 +3922,10 @@ async def answer_ticket_question(message):
     ai_busy_channels.add(channel.id)
     try:
         async with channel.typing():
-            answer = await ai_support.ask_ai(build_ai_system_prompt(_latest_order_in_channel(channel.id)), merged)
+            answer = await ai_support.ask_ai(
+                build_ai_system_prompt(_latest_order_in_channel(channel.id), merged[-1][1] if merged else content),
+                merged,
+            )
     except Exception as error:
         log_unexpected_error("AIの返答", error)
         answer = None
@@ -3829,6 +3935,9 @@ async def answer_ticket_question(message):
         return
 
     call_staff = AI_STAFF_MARK in answer
+    if call_staff:
+        # このあとスタッフが返した答えを、この質問とセットで覚える
+        record_escalation(channel.id, merged[-1][1] if merged else _mask_private(content))
     answer = answer.replace(AI_STAFF_MARK, "").strip()[:1700]
     footer = "\n-# 🤖 AIの自動返信です"
     if call_staff:
@@ -3881,6 +3990,38 @@ async def setup_ticket(ctx):
 
 
 @bot.command()
+async def ai_memory(ctx):
+    """AIが覚えた質問と答えの一覧（新しい順）。"""
+    if not is_command_owner(ctx.author):
+        return
+    entries = _load_knowledge()["entries"]
+    if not entries:
+        await ctx.send("AIが覚えた内容はまだありません。")
+        return
+    lines = [f"🧠 **AIが覚えた内容**（{len(entries)}件・新しい順）　消すときは `!ai_forget 番号`"]
+    for e in reversed(entries[-20:]):
+        lines.append(f"**#{e['id']}**　Q：{e['q'][:80]}\n　　A：{e['a'][:120]}")
+    text = "\n".join(lines)
+    for start in range(0, len(text), 1900):
+        await ctx.send(text[start:start + 1900], allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.command()
+async def ai_forget(ctx, entry_id: int):
+    """AIが覚えた内容を1件消す。"""
+    if not is_command_owner(ctx.author):
+        return
+    data = _load_knowledge()
+    before = len(data["entries"])
+    data["entries"] = [e for e in data["entries"] if e["id"] != entry_id]
+    if len(data["entries"]) == before:
+        await ctx.send(f"#{entry_id} は見つかりませんでした。")
+        return
+    _save_knowledge()
+    await ctx.send(f"#{entry_id} を消しました。")
+
+
+@bot.command()
 async def order_panel(ctx):
     """チケット内に受付パネルを出し直す（スタッフ用）。"""
     if not is_command_owner(ctx.author):
@@ -3919,6 +4060,13 @@ async def on_message(message):
         except discord.HTTPException as error:
             log_http_error("PayPayリンクを含むメッセージの削除", error)
         return
+
+    # AIが分からなかった質問に、スタッフが返した答えを覚える
+    if (not message.author.bot
+            and is_ticket(message.channel)
+            and is_staff(message.author)
+            and not (message.content or "").startswith("!")):
+        learn_from_staff(message)
 
     # チケットの中で、お客様本人の書き込みにはAIが答える
     if (not message.author.bot
